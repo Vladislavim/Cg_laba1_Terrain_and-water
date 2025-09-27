@@ -1,0 +1,31 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.14.36127.28 d17.14
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Cg_laba1_Terrain_and water", "Cg_laba1_Terrain_and water\Cg_laba1_Terrain_and water.vcxproj", "{D608B918-0926-494B-8832-34E4AFF28493}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|x64 = Debug|x64
+		Debug|x86 = Debug|x86
+		Release|x64 = Release|x64
+		Release|x86 = Release|x86
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{D608B918-0926-494B-8832-34E4AFF28493}.Debug|x64.ActiveCfg = Debug|x64
+		{D608B918-0926-494B-8832-34E4AFF28493}.Debug|x64.Build.0 = Debug|x64
+		{D608B918-0926-494B-8832-34E4AFF28493}.Debug|x86.ActiveCfg = Debug|Win32
+		{D608B918-0926-494B-8832-34E4AFF28493}.Debug|x86.Build.0 = Debug|Win32
+		{D608B918-0926-494B-8832-34E4AFF28493}.Release|x64.ActiveCfg = Release|x64
+		{D608B918-0926-494B-8832-34E4AFF28493}.Release|x64.Build.0 = Release|x64
+		{D608B918-0926-494B-8832-34E4AFF28493}.Release|x86.ActiveCfg = Release|Win32
+		{D608B918-0926-494B-8832-34E4AFF28493}.Release|x86.Build.0 = Release|Win32
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {7072B0D8-3B00-4516-8593-9233BA98B9D7}
+	EndGlobalSection
+EndGlobal
