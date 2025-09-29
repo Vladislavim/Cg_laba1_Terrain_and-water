@@ -11,45 +11,57 @@
 #include <cstdarg>
 #include <cstdio>
 
-// ≈дина€ настройка шага сетки 
-static int& TerrainTessStep()
+//   helpers  
+
+// общий шаг тессел€ции (храним в статике)
+static int& G_TerrainTess()
 {
-    static int s_step = 64;
-    return s_step;
+    static int g_tess = 16;
+    return g_tess;
 }
 
-static bool HasExtA(const char* fn, const char* ext)
+// проверка расширени€ файла без аллокаций
+static bool HasExtNoCase(const char* fileName, const char* ext)
 {
-    size_t n = std::strlen(fn), m = std::strlen(ext);
+    size_t n = std::strlen(fileName), m = std::strlen(ext);
     if (n < m) return false;
 #ifdef _WIN32
-    return _stricmp(fn + (n - m), ext) == 0;
+    return _stricmp(fileName + (n - m), ext) == 0;
 #else
     auto tolow = [](char c) { return (char)std::tolower((unsigned char)c); };
     for (size_t i = 0; i < m; ++i)
-        if (tolow(fn[n - m + i]) != tolow(ext[i])) return false;
+        if (tolow(fileName[n - m + i]) != tolow(ext[i])) return false;
     return true;
 #endif
 }
 
+static inline float clamp01(float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); }
 
-// тут создаем террейн: грузим карты, делаем сетку и дерево (LOD через квадродерево)
-Terrain::Terrain(ResourceManager* rm, TerrainMaterial* mat, const char* fnHeightmap, const char* fnDisplacementMap) :
-    m_pMat(mat), m_pResMgr(rm) {
+//   Terrain  
+
+Terrain::Terrain(ResourceManager* rm, TerrainMaterial* mat,
+    const char* fnHeightmap, const char* fnDisplacementMap)
+    : m_pMat(mat), m_pResMgr(rm)
+{
+    // инициализаци€
     m_dataHeightMap = nullptr;
     m_dataDisplacementMap = nullptr;
     m_dataVertices = nullptr;
     m_dataIndices = nullptr;
     m_pConstants = nullptr;
 
+    // загрузка карт
     LoadHeightMap(fnHeightmap);
     LoadDisplacementMap(fnDisplacementMap);
 
+    // построение
     CreateMesh3D();
     BuildQT();
 }
 
-Terrain::~Terrain() {
+Terrain::~Terrain()
+{
+    // чистим только CPU-часть
     m_dataHeightMap = nullptr;
     m_dataDisplacementMap = nullptr;
     DeleteVertexAndIndexArrays();
@@ -57,254 +69,302 @@ Terrain::~Terrain() {
     delete m_pMat;
 }
 
-void Terrain::Draw(ID3D12GraphicsCommandList* cmdList, bool Draw3D) {
-    if (Draw3D) {
+void Terrain::Draw(ID3D12GraphicsCommandList* cmdList, bool draw3D)
+{
+    if (draw3D) {
         cmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_4_CONTROL_POINT_PATCHLIST);
         cmdList->IASetVertexBuffers(0, 1, &m_viewVertexBuffer);
         cmdList->IASetIndexBuffer(&m_viewIndexBuffer);
         cmdList->DrawIndexedInstanced(m_numIndices, 1, 0, 0, 0);
     }
     else {
+        // проста€ заглушка
         cmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         cmdList->DrawInstanced(3, 1, 0, 0);
     }
 }
 
-void Terrain::DeleteVertexAndIndexArrays() {
-    if (m_dataVertices) { delete[] m_dataVertices; m_dataVertices = nullptr; }
-    if (m_dataIndices) { delete[] m_dataIndices;  m_dataIndices = nullptr; }
-    if (m_pConstants) { delete   m_pConstants;   m_pConstants = nullptr; }
+void Terrain::DeleteVertexAndIndexArrays()
+{
+    if (m_dataVertices) { delete[] m_dataVertices;   m_dataVertices = nullptr; }
+    if (m_dataIndices) { delete[] m_dataIndices;    m_dataIndices = nullptr; }
+    if (m_pConstants) { delete   m_pConstants;     m_pConstants = nullptr; }
 }
 
-static inline float clamp01(float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); }
+// построение сетки + буферы
+void Terrain::CreateMesh3D()
+{
+    float mountainsScale = 1.0f;
+    m_scaleHeightMap = (float)m_wHeightMap / 16.0f * mountainsScale;
 
-void Terrain::CreateMesh3D() {
-    float kMountains = 1.0f;
-    m_scaleHeightMap = (float)m_wHeightMap / 16.0f * kMountains;
-    int tessFactor = TerrainTessStep();
-    int scalePatchX = m_wHeightMap / tessFactor;
-    int scalePatchY = m_hHeightMap / tessFactor;
-    int numVertsInTerrain = scalePatchX * scalePatchY;
-    m_numVertices = numVertsInTerrain + scalePatchX * 4;
+    const int tess = G_TerrainTess();
+    const int patchCountX = m_wHeightMap / tess;
+    const int patchCountY = m_hHeightMap / tess;
 
-    int arrSize = (int)(m_numVertices);
-    m_dataVertices = new Vertex[arrSize];
+    const int gridVerts = patchCountX * patchCountY;
+    m_numVertices = gridVerts + patchCountX * 4; // + юбка
 
-    for (int y = 0; y < scalePatchY; ++y) {
-        for (int x = 0; x < scalePatchX; ++x) {
-            float u = (float)x / (float)m_wHeightMap;
-            float v = (float)y / (float)m_hHeightMap;
-            float cx = (float)m_wHeightMap * 0.5f;
-            float cy = (float)m_hHeightMap * 0.5f;
-            float dx = ((float)x * tessFactor - cx) / (float)m_wHeightMap;
-            float dy = ((float)y * tessFactor - cy) / (float)m_hHeightMap;
-            float r = sqrtf(dx * dx + dy * dy);
+    // вершины
+    {
+        const int totalVerts = (int)m_numVertices;
+        m_dataVertices = new Vertex[totalVerts];
 
-            int sx = x * tessFactor;
-            int sy = y * tessFactor;
-            int idx = (sy * (int)m_wHeightMap + sx) * 4;
-            float base = (float)m_dataHeightMap[idx] / 255.0f * 0.5f;
-            float wave1 = 0.15f * sinf(12.0f * u + 7.0f * v);
-            float wave2 = 0.10f * cosf(18.0f * u - 11.0f * v);
-            float rings = 0.12f * sinf(30.0f * r);
-            float terraces = 0.0f;
-            float h = clamp01(base + wave1 + wave2 + rings + terraces * 0.3f) * m_scaleHeightMap * 1.5f;
+        for (int py = 0; py < patchCountY; ++py) {
+            for (int px = 0; px < patchCountX; ++px) {
+                float u = (float)px / (float)m_wHeightMap;
+                float v = (float)py / (float)m_hHeightMap;
 
-            m_dataVertices[y * scalePatchX + x].position = XMFLOAT3((float)x * tessFactor, (float)y * tessFactor, h);
-            m_dataVertices[y * scalePatchX + x].skirt = 5;
+                float cx = (float)m_wHeightMap * 0.5f;
+                float cy = (float)m_hHeightMap * 0.5f;
+                float dx = ((float)px * tess - cx) / (float)m_wHeightMap;
+                float dy = ((float)py * tess - cy) / (float)m_hHeightMap;
+                float r = sqrtf(dx * dx + dy * dy);
+
+                int sx = px * tess;
+                int sy = py * tess;
+                int idxHM = (sy * (int)m_wHeightMap + sx) * 4;
+
+                float base = (float)m_dataHeightMap[idxHM] / 255.0f * 0.5f;
+                float wave1 = 0.15f * sinf(12.0f * u + 7.0f * v);
+                float wave2 = 0.10f * cosf(18.0f * u - 11.0f * v);
+                float rings = 0.12f * sinf(30.0f * r);
+                float terraces = 0.0f; // пока не юзаю
+                float height = clamp01(base + wave1 + wave2 + rings + terraces * 0.3f) * m_scaleHeightMap * 1.5f;
+
+                const int vIdx = py * patchCountX + px;
+                m_dataVertices[vIdx].position = XMFLOAT3((float)px * tess, (float)py * tess, height);
+                m_dataVertices[vIdx].skirt = 5; // обычна€ вершина
+            }
+        }
+
+        XMFLOAT2 zBounds = CalcZBounds(m_dataVertices[0], m_dataVertices[gridVerts - 1]);
+        m_hBase = zBounds.x - 10;
+
+        // юбка (4 стороны)
+        int writeV = gridVerts;
+
+        // низ
+        for (int px = 0; px < patchCountX; ++px) {
+            m_dataVertices[writeV].position = XMFLOAT3((float)(px * tess), 0.0f, m_hBase);
+            m_dataVertices[writeV++].skirt = 1;
+        }
+        // верх
+        for (int px = 0; px < patchCountX; ++px) {
+            m_dataVertices[writeV].position = XMFLOAT3((float)(px * tess), (float)(m_hHeightMap - tess), m_hBase);
+            m_dataVertices[writeV++].skirt = 2;
+        }
+        // лево
+        for (int py = 0; py < patchCountY; ++py) {
+            m_dataVertices[writeV].position = XMFLOAT3(0.0f, (float)(py * tess), m_hBase);
+            m_dataVertices[writeV++].skirt = 3;
+        }
+        // право
+        for (int py = 0; py < patchCountY; ++py) {
+            m_dataVertices[writeV].position = XMFLOAT3((float)(m_wHeightMap - tess), (float)(py * tess), m_hBase);
+            m_dataVertices[writeV++].skirt = 4;
         }
     }
 
-    XMFLOAT2 zBounds = CalcZBounds(m_dataVertices[0], m_dataVertices[numVertsInTerrain - 1]);
-    m_hBase = zBounds.x - 10;
+    // индексы (патчи 4-вершинные)
+    {
+        const int bodyPatches = (patchCountX - 1) * (patchCountY - 1);
+        const int skirtH = 2 * (patchCountX - 1);
+        const int skirtV = 2 * (patchCountY - 1);
+        const int idxCount = bodyPatches * 4 + (skirtH + skirtV) * 4;
 
-    int iVertex = numVertsInTerrain;
-    for (int x = 0; x < scalePatchX; ++x) {
-        m_dataVertices[iVertex].position = XMFLOAT3((float)(x * tessFactor), 0.0f, m_hBase);
-        m_dataVertices[iVertex++].skirt = 1;
-    }
-    for (int x = 0; x < scalePatchX; ++x) {
-        m_dataVertices[iVertex].position = XMFLOAT3((float)(x * tessFactor), (float)(m_hHeightMap - tessFactor), m_hBase);
-        m_dataVertices[iVertex++].skirt = 2;
-    }
-    for (int y = 0; y < scalePatchY; ++y) {
-        m_dataVertices[iVertex].position = XMFLOAT3(0.0f, (float)(y * tessFactor), m_hBase);
-        m_dataVertices[iVertex++].skirt = 3;
-    }
-    for (int y = 0; y < scalePatchY; ++y) {
-        m_dataVertices[iVertex].position = XMFLOAT3((float)(m_wHeightMap - tessFactor), (float)(y * tessFactor), m_hBase);
-        m_dataVertices[iVertex++].skirt = 4;
-    }
+        m_dataIndices = new UINT[idxCount];
 
-    arrSize = (scalePatchX - 1) * (scalePatchY - 1) * 4
-        + 2 * 4 * (scalePatchX - 1)
-        + 2 * 4 * (scalePatchY - 1);
-    m_dataIndices = new UINT[arrSize];
+        int w = 0;
 
-    int i = 0;
-    for (int y = 0; y < scalePatchY - 1; ++y) {
-        for (int x = 0; x < scalePatchX - 1; ++x) {
-            UINT vert0 = x + y * scalePatchX;
-            UINT vert1 = x + 1 + y * scalePatchX;
-            UINT vert2 = x + (y + 1) * scalePatchX;
-            UINT vert3 = x + 1 + (y + 1) * scalePatchX;
-            m_dataIndices[i++] = vert0;
-            m_dataIndices[i++] = vert1;
-            m_dataIndices[i++] = vert2;
-            m_dataIndices[i++] = vert3;
+        // тело
+        for (int py = 0; py < patchCountY - 1; ++py) {
+            for (int px = 0; px < patchCountX - 1; ++px) {
+                UINT v0 = px + py * patchCountX;
+                UINT v1 = px + 1 + py * patchCountX;
+                UINT v2 = px + (py + 1) * patchCountX;
+                UINT v3 = px + 1 + (py + 1) * patchCountX;
 
-            XMFLOAT2 bz = CalcZBounds(m_dataVertices[vert0], m_dataVertices[vert3]);
-            m_dataVertices[vert0].aabbmin = XMFLOAT3(m_dataVertices[vert0].position.x - 0.5f, m_dataVertices[vert0].position.y - 0.5f, bz.x - 0.5f);
-            m_dataVertices[vert0].aabbmax = XMFLOAT3(m_dataVertices[vert3].position.x + 0.5f, m_dataVertices[vert3].position.y + 0.5f, bz.y + 0.5f);
+                m_dataIndices[w++] = v0;
+                m_dataIndices[w++] = v1;
+                m_dataIndices[w++] = v2;
+                m_dataIndices[w++] = v3;
+
+                XMFLOAT2 bz = CalcZBounds(m_dataVertices[v0], m_dataVertices[v3]);
+                m_dataVertices[v0].aabbmin = XMFLOAT3(m_dataVertices[v0].position.x - 0.5f, m_dataVertices[v0].position.y - 0.5f, bz.x - 0.5f);
+                m_dataVertices[v0].aabbmax = XMFLOAT3(m_dataVertices[v3].position.x + 0.5f, m_dataVertices[v3].position.y + 0.5f, bz.y + 0.5f);
+            }
         }
+
+        // юбка
+        int readSkirtV = patchCountX * patchCountY;
+
+        // низ
+        for (int px = 0; px < patchCountX - 1; ++px) {
+            m_dataIndices[w++] = readSkirtV;
+            m_dataIndices[w++] = readSkirtV + 1;
+            m_dataIndices[w++] = px;
+            m_dataIndices[w++] = px + 1;
+
+            XMFLOAT2 bz = CalcZBounds(m_dataVertices[px], m_dataVertices[px + 1]);
+            m_dataVertices[readSkirtV].aabbmin = XMFLOAT3((float)(px * tess), 0.0f, m_hBase);
+            m_dataVertices[readSkirtV++].aabbmax = XMFLOAT3((float)((px + 1) * tess), 0.0f, bz.y);
+        }
+
+        // верх
+        ++readSkirtV;
+        for (int px = 0; px < patchCountX - 1; ++px) {
+            m_dataIndices[w++] = readSkirtV + 1;
+            m_dataIndices[w++] = readSkirtV;
+            int offsetTop = patchCountX * (patchCountY - 1);
+            m_dataIndices[w++] = px + offsetTop + 1;
+            m_dataIndices[w++] = px + offsetTop;
+
+            XMFLOAT2 bz = CalcZBounds(m_dataVertices[px + offsetTop], m_dataVertices[px + offsetTop + 1]);
+            m_dataVertices[++readSkirtV].aabbmin = XMFLOAT3((float)(px * tess), (float)(m_hHeightMap - tess), m_hBase);
+            m_dataVertices[readSkirtV].aabbmax = XMFLOAT3((float)((px + 1) * tess), (float)(m_hHeightMap - tess), bz.y);
+        }
+
+        // лево
+        ++readSkirtV;
+        for (int py = 0; py < patchCountY - 1; ++py) {
+            m_dataIndices[w++] = readSkirtV + 1;
+            m_dataIndices[w++] = readSkirtV;
+            m_dataIndices[w++] = (py + 1) * patchCountX;
+            m_dataIndices[w++] = py * patchCountX;
+
+            XMFLOAT2 bz = CalcZBounds(m_dataVertices[py * patchCountX], m_dataVertices[(py + 1) * patchCountX]);
+            m_dataVertices[++readSkirtV].aabbmin = XMFLOAT3(0.0f, (float)(py * tess), m_hBase);
+            m_dataVertices[readSkirtV].aabbmax = XMFLOAT3(0.0f, (float)((py + 1) * tess), bz.y);
+        }
+
+        // право
+        ++readSkirtV;
+        for (int py = 0; py < patchCountY - 1; ++py) {
+            m_dataIndices[w++] = readSkirtV;
+            m_dataIndices[w++] = readSkirtV + 1;
+            m_dataIndices[w++] = py * patchCountX + patchCountX - 1;
+            m_dataIndices[w++] = (py + 1) * patchCountX + patchCountX - 1;
+
+            XMFLOAT2 bz = CalcZBounds(m_dataVertices[py * patchCountX + patchCountX - 1],
+                m_dataVertices[(py + 1) * patchCountX + patchCountX - 1]);
+            m_dataVertices[readSkirtV].aabbmin = XMFLOAT3((float)(m_wHeightMap - tess), (float)(py * tess), m_hBase);
+            m_dataVertices[readSkirtV++].aabbmax = XMFLOAT3((float)(m_wHeightMap - tess), (float)((py + 1) * tess), bz.y);
+        }
+
+        m_numIndices = idxCount;
     }
 
-    iVertex = numVertsInTerrain;
-    for (int x = 0; x < scalePatchX - 1; ++x) {
-        m_dataIndices[i++] = iVertex;
-        m_dataIndices[i++] = iVertex + 1;
-        m_dataIndices[i++] = x;
-        m_dataIndices[i++] = x + 1;
-        XMFLOAT2 bz = CalcZBounds(m_dataVertices[x], m_dataVertices[x + 1]);
-        m_dataVertices[iVertex].aabbmin = XMFLOAT3((float)(x * tessFactor), 0.0f, m_hBase);
-        m_dataVertices[iVertex++].aabbmax = XMFLOAT3((float)((x + 1) * tessFactor), 0.0f, bz.y);
-    }
-
-    ++iVertex;
-    for (int x = 0; x < scalePatchX - 1; ++x) {
-        m_dataIndices[i++] = iVertex + 1;
-        m_dataIndices[i++] = iVertex;
-        int offset = scalePatchX * (scalePatchY - 1);
-        m_dataIndices[i++] = x + offset + 1;
-        m_dataIndices[i++] = x + offset;
-        XMFLOAT2 bz = CalcZBounds(m_dataVertices[x + offset], m_dataVertices[x + offset + 1]);
-        m_dataVertices[++iVertex].aabbmin = XMFLOAT3((float)(x * tessFactor), (float)(m_hHeightMap - tessFactor), m_hBase);
-        m_dataVertices[iVertex].aabbmax = XMFLOAT3((float)((x + 1) * tessFactor), (float)(m_hHeightMap - tessFactor), bz.y);
-    }
-
-    ++iVertex;
-    for (int y = 0; y < scalePatchY - 1; ++y) {
-        m_dataIndices[i++] = iVertex + 1;
-        m_dataIndices[i++] = iVertex;
-        m_dataIndices[i++] = (y + 1) * scalePatchX;
-        m_dataIndices[i++] = y * scalePatchX;
-        XMFLOAT2 bz = CalcZBounds(m_dataVertices[y * scalePatchX], m_dataVertices[(y + 1) * scalePatchX]);
-        m_dataVertices[++iVertex].aabbmin = XMFLOAT3(0.0f, (float)(y * tessFactor), m_hBase);
-        m_dataVertices[iVertex].aabbmax = XMFLOAT3(0.0f, (float)((y + 1) * tessFactor), bz.y);
-    }
-
-    ++iVertex;
-    for (int y = 0; y < scalePatchY - 1; ++y) {
-        m_dataIndices[i++] = iVertex;
-        m_dataIndices[i++] = iVertex + 1;
-        m_dataIndices[i++] = y * scalePatchX + scalePatchX - 1;
-        m_dataIndices[i++] = (y + 1) * scalePatchX + scalePatchX - 1;
-        XMFLOAT2 bz = CalcZBounds(m_dataVertices[y * scalePatchX + scalePatchX - 1], m_dataVertices[(y + 1) * scalePatchX + scalePatchX - 1]);
-        m_dataVertices[iVertex].aabbmin = XMFLOAT3((float)(m_wHeightMap - tessFactor), (float)(y * tessFactor), m_hBase);
-        m_dataVertices[iVertex++].aabbmax = XMFLOAT3((float)(m_wHeightMap - tessFactor), (float)((y + 1) * tessFactor), bz.y);
-    }
-
-    m_numIndices = arrSize;
-
+    // GPU-буферы
     CreateVertexBuffer();
     CreateIndexBuffer();
     CreateConstantBuffer();
 
-    float w = (float)m_wHeightMap / 2.0f;
-    float h = (float)m_hHeightMap / 2.0f;
-    m_BoundingSphere.SetCenter(w, h, (zBounds.y + zBounds.x) / 2.0f);
-    m_BoundingSphere.SetRadius(sqrtf(w * w + h * h));
+    // сфера дл€ простых тестов видимости
+    float hw = (float)m_wHeightMap * 0.5f;
+    float hh = (float)m_hHeightMap * 0.5f;
+
+    XMFLOAT2 zb = CalcZBounds(m_dataVertices[0], m_dataVertices[(patchCountX * patchCountY) - 1]);
+    m_BoundingSphere.SetCenter(hw, hh, (zb.y + zb.x) * 0.5f);
+    m_BoundingSphere.SetRadius(sqrtf(hw * hw + hh * hh));
 }
 
-void Terrain::CreateVertexBuffer() {
-    ID3D12Resource* buffer = nullptr;
+//   GPU buffers  
+
+void Terrain::CreateVertexBuffer()
+{
+    ID3D12Resource* vbRes = nullptr;
 
     D3D12_RESOURCE_DESC vbDesc = CD3DX12_RESOURCE_DESC::Buffer(m_numVertices * sizeof(Vertex));
     CD3DX12_HEAP_PROPERTIES defHeap(D3D12_HEAP_TYPE_DEFAULT);
 
-    auto iBuffer = m_pResMgr->NewBuffer(buffer, &vbDesc, &defHeap,
+    auto vbIndex = m_pResMgr->NewBuffer(vbRes, &vbDesc, &defHeap,
         D3D12_HEAP_FLAG_NONE, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, nullptr);
-    buffer->SetName(L"Terrain Vertex Buffer");
+    vbRes->SetName(L"Terrain Vertex Buffer");
 
-    auto sizeofVertexBuffer = GetRequiredIntermediateSize(buffer, 0, 1);
+    auto vbSize = GetRequiredIntermediateSize(vbRes, 0, 1);
 
-    D3D12_SUBRESOURCE_DATA dataVB = {};
-    dataVB.pData = m_dataVertices;
-    dataVB.RowPitch = sizeofVertexBuffer;
-    dataVB.SlicePitch = sizeofVertexBuffer;
+    D3D12_SUBRESOURCE_DATA vbData = {};
+    vbData.pData = m_dataVertices;
+    vbData.RowPitch = vbSize;
+    vbData.SlicePitch = vbSize;
 
-    m_pResMgr->UploadToBuffer(iBuffer, 1, &dataVB, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+    m_pResMgr->UploadToBuffer(vbIndex, 1, &vbData, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
 
     m_viewVertexBuffer = {};
-    m_viewVertexBuffer.BufferLocation = buffer->GetGPUVirtualAddress();
+    m_viewVertexBuffer.BufferLocation = vbRes->GetGPUVirtualAddress();
     m_viewVertexBuffer.StrideInBytes = sizeof(Vertex);
-    m_viewVertexBuffer.SizeInBytes = (UINT)sizeofVertexBuffer;
+    m_viewVertexBuffer.SizeInBytes = (UINT)vbSize;
 }
 
-void Terrain::CreateIndexBuffer() {
-    ID3D12Resource* buffer = nullptr;
+void Terrain::CreateIndexBuffer()
+{
+    ID3D12Resource* ibRes = nullptr;
 
     D3D12_RESOURCE_DESC ibDesc = CD3DX12_RESOURCE_DESC::Buffer(m_numIndices * sizeof(UINT));
     CD3DX12_HEAP_PROPERTIES defHeap(D3D12_HEAP_TYPE_DEFAULT);
 
-    auto iBuffer = m_pResMgr->NewBuffer(buffer, &ibDesc, &defHeap,
+    auto ibIndex = m_pResMgr->NewBuffer(ibRes, &ibDesc, &defHeap,
         D3D12_HEAP_FLAG_NONE, D3D12_RESOURCE_STATE_INDEX_BUFFER, nullptr);
-    buffer->SetName(L"Terrain Index Buffer");
+    ibRes->SetName(L"Terrain Index Buffer");
 
-    auto sizeofIndexBuffer = GetRequiredIntermediateSize(buffer, 0, 1);
+    auto ibSize = GetRequiredIntermediateSize(ibRes, 0, 1);
 
-    D3D12_SUBRESOURCE_DATA dataIB = {};
-    dataIB.pData = m_dataIndices;
-    dataIB.RowPitch = sizeofIndexBuffer;
-    dataIB.SlicePitch = sizeofIndexBuffer;
+    D3D12_SUBRESOURCE_DATA ibData = {};
+    ibData.pData = m_dataIndices;
+    ibData.RowPitch = ibSize;
+    ibData.SlicePitch = ibSize;
 
-    m_pResMgr->UploadToBuffer(iBuffer, 1, &dataIB, D3D12_RESOURCE_STATE_INDEX_BUFFER);
+    m_pResMgr->UploadToBuffer(ibIndex, 1, &ibData, D3D12_RESOURCE_STATE_INDEX_BUFFER);
 
     m_viewIndexBuffer = {};
-    m_viewIndexBuffer.BufferLocation = buffer->GetGPUVirtualAddress();
+    m_viewIndexBuffer.BufferLocation = ibRes->GetGPUVirtualAddress();
     m_viewIndexBuffer.Format = DXGI_FORMAT_R32_UINT;
-    m_viewIndexBuffer.SizeInBytes = (UINT)sizeofIndexBuffer;
+    m_viewIndexBuffer.SizeInBytes = (UINT)ibSize;
 }
 
-void Terrain::CreateConstantBuffer() {
-    ID3D12Resource* buffer = nullptr;
+void Terrain::CreateConstantBuffer()
+{
+    ID3D12Resource* cbRes = nullptr;
 
     D3D12_RESOURCE_DESC cbDesc = CD3DX12_RESOURCE_DESC::Buffer(sizeof(TerrainShaderConstants));
     CD3DX12_HEAP_PROPERTIES defHeap(D3D12_HEAP_TYPE_DEFAULT);
 
-    auto iBuffer = m_pResMgr->NewBuffer(buffer, &cbDesc, &defHeap,
+    auto cbIndex = m_pResMgr->NewBuffer(cbRes, &cbDesc, &defHeap,
         D3D12_HEAP_FLAG_NONE, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, nullptr);
-    buffer->SetName(L"Terrain Shader Constants Buffer");
+    cbRes->SetName(L"Terrain Shader Constants Buffer");
 
-    auto sizeofBuffer = GetRequiredIntermediateSize(buffer, 0, 1);
+    auto cbSize = GetRequiredIntermediateSize(cbRes, 0, 1);
 
     m_pConstants = new TerrainShaderConstants(m_scaleHeightMap, (float)m_wHeightMap, (float)m_hHeightMap, m_hBase);
 
-    D3D12_SUBRESOURCE_DATA dataCB = {};
-    dataCB.pData = m_pConstants;
-    dataCB.RowPitch = sizeofBuffer;
-    dataCB.SlicePitch = sizeofBuffer;
+    D3D12_SUBRESOURCE_DATA cbData = {};
+    cbData.pData = m_pConstants;
+    cbData.RowPitch = cbSize;
+    cbData.SlicePitch = cbSize;
 
-    m_pResMgr->UploadToBuffer(iBuffer, 1, &dataCB, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+    m_pResMgr->UploadToBuffer(cbIndex, 1, &cbData, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
 
-    D3D12_CONSTANT_BUFFER_VIEW_DESC descCBV = {};
-    descCBV.BufferLocation = buffer->GetGPUVirtualAddress();
-    descCBV.SizeInBytes = (sizeof(TerrainShaderConstants) + 255) & ~255;
+    D3D12_CONSTANT_BUFFER_VIEW_DESC cbvDesc = {};
+    cbvDesc.BufferLocation = cbRes->GetGPUVirtualAddress();
+    cbvDesc.SizeInBytes = (sizeof(TerrainShaderConstants) + 255) & ~255;
 
-    m_pResMgr->AddCBV(&descCBV, m_hdlConstantsCBV_CPU, m_hdlConstantsCBV_GPU);
+    m_pResMgr->AddCBV(&cbvDesc, m_hdlConstantsCBV_CPU, m_hdlConstantsCBV_GPU);
 }
 
-XMFLOAT2 Terrain::CalcZBounds(Vertex bottomLeft, Vertex topRight) {
+//   данные высот/смещени€ ====
+
+XMFLOAT2 Terrain::CalcZBounds(Vertex bl, Vertex tr)
+{
     float zmax = -100000.0f;
     float zmin = 100000.0f;
 
-    int bottomLeftX = (bottomLeft.position.x <= 0.0f) ? 0 : (int)bottomLeft.position.x - 1;
-    int bottomLeftY = (bottomLeft.position.y <= 0.0f) ? 0 : (int)bottomLeft.position.y - 1;
-    int topRightX = (topRight.position.x >= (float)(m_wHeightMap - 1)) ? (m_wHeightMap - 1) : (int)topRight.position.x + 1;
-    int topRightY = (topRight.position.y >= (float)(m_hHeightMap - 1)) ? (m_hHeightMap - 1) : (int)topRight.position.y + 1;
+    int x0 = (bl.position.x <= 0.0f) ? 0 : (int)bl.position.x - 1;
+    int y0 = (bl.position.y <= 0.0f) ? 0 : (int)bl.position.y - 1;
+    int x1 = (tr.position.x >= (float)(m_wHeightMap - 1)) ? (m_wHeightMap - 1) : (int)tr.position.x + 1;
+    int y1 = (tr.position.y >= (float)(m_hHeightMap - 1)) ? (m_hHeightMap - 1) : (int)tr.position.y + 1;
 
-    for (int y = bottomLeftY; y <= topRightY; ++y) {
-        for (int x = bottomLeftX; x <= topRightX; ++x) {
+    for (int y = y0; y <= y1; ++y) {
+        for (int x = x0; x <= x1; ++x) {
             float z = ((float)m_dataHeightMap[(x + y * m_wHeightMap) * 4] / 255.0f) * m_scaleHeightMap;
             if (z > zmax) zmax = z;
             if (z < zmin) zmin = z;
@@ -315,7 +375,7 @@ XMFLOAT2 Terrain::CalcZBounds(Vertex bottomLeft, Vertex topRight) {
 
 void Terrain::LoadHeightMap(const char* fnHeightMap)
 {
-    if (HasExtA(fnHeightMap, ".dds")) {
+    if (HasExtNoCase(fnHeightMap, ".dds")) {
         unsigned int h = 0, w = 0;
         unsigned int idxCpu = m_pResMgr->LoadDDS_CPU_RGBA8A(fnHeightMap, h, w);
         m_dataHeightMap = m_pResMgr->GetFileData(idxCpu);
@@ -367,7 +427,7 @@ void Terrain::LoadHeightMap(const char* fnHeightMap)
 
 void Terrain::LoadDisplacementMap(const char* fnMap)
 {
-    if (HasExtA(fnMap, ".dds")) {
+    if (HasExtNoCase(fnMap, ".dds")) {
         unsigned int h = 0, w = 0;
         unsigned int idxCpu = m_pResMgr->LoadDDS_CPU_RGBA8A(fnMap, h, w);
         m_dataDisplacementMap = m_pResMgr->GetFileData(idxCpu);
@@ -451,26 +511,29 @@ void Terrain::LoadDisplacementMap(const char* fnMap)
     }
 }
 
+//   биндинги  
 
-// прив€зка ресурсов террейна
-void Terrain::AttachTerrainResources(ID3D12GraphicsCommandList* cmdList, unsigned int srvDescTableIndexHeightMap,
-    unsigned int srvDescTableIndexDisplacementMap, unsigned int cbvDescTableIndex) {
-    cmdList->SetGraphicsRootDescriptorTable(srvDescTableIndexHeightMap, m_hdlHeightMapSRV_GPU);
-    cmdList->SetGraphicsRootDescriptorTable(srvDescTableIndexDisplacementMap, m_hdlDisplacementMapSRV_GPU);
-    cmdList->SetGraphicsRootDescriptorTable(cbvDescTableIndex, m_hdlConstantsCBV_GPU);
+void Terrain::AttachTerrainResources(ID3D12GraphicsCommandList* cmdList,
+    unsigned int slotHM, unsigned int slotDM, unsigned int slotCBV)
+{
+    cmdList->SetGraphicsRootDescriptorTable(slotHM, m_hdlHeightMapSRV_GPU);
+    cmdList->SetGraphicsRootDescriptorTable(slotDM, m_hdlDisplacementMapSRV_GPU);
+    cmdList->SetGraphicsRootDescriptorTable(slotCBV, m_hdlConstantsCBV_GPU);
 }
 
-void Terrain::AttachMaterialResources(ID3D12GraphicsCommandList* cmdList, unsigned int srvDescTableIndex) {
-    m_pMat->Attach(cmdList, srvDescTableIndex);
+void Terrain::AttachMaterialResources(ID3D12GraphicsCommandList* cmdList, unsigned int srvTableIndex)
+{
+    m_pMat->Attach(cmdList, srvTableIndex);
 }
 
-float Terrain::GetHeightMapValueAtPoint(float x, float y) {
+//   выборка по картам  
+
+float Terrain::GetHeightMapValueAtPoint(float x, float y)
+{
     auto clampi = [](int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); };
 
-    float x1f = floorf(x);
-    float x2f = ceilf(x);
-    float y1f = floorf(y);
-    float y2f = ceilf(y);
+    float x1f = floorf(x), x2f = ceilf(x);
+    float y1f = floorf(y), y2f = ceilf(y);
 
     int x1 = clampi((int)x1f, 0, (int)m_wHeightMap - 1);
     int x2 = clampi((int)x2f, 0, (int)m_wHeightMap - 1);
@@ -488,22 +551,22 @@ float Terrain::GetHeightMapValueAtPoint(float x, float y) {
     return bilerp(a, b, c, d, dx, dy);
 }
 
-float Terrain::GetDisplacementMapValueAtPoint(float x, float y) {
-    float _x = (x / (float)m_wDisplacementMap) / 32.0f;
-    float _y = (y / (float)m_hDisplacementMap) / 32.0f;
+float Terrain::GetDisplacementMapValueAtPoint(float x, float y)
+{
+    // тайлим карту, чтоб видеть мелочь
+    float u = (x / (float)m_wDisplacementMap) / 32.0f;
+    float v = (y / (float)m_hDisplacementMap) / 32.0f;
 
-    _x = _x - floorf(_x);
-    _y = _y - floorf(_y);
+    u = u - floorf(u);
+    v = v - floorf(v);
 
-    float X = _x * (float)(m_wDisplacementMap - 1);
-    float Y = _y * (float)(m_hDisplacementMap - 1);
+    float X = u * (float)(m_wDisplacementMap - 1);
+    float Y = v * (float)(m_hDisplacementMap - 1);
 
     auto clampi = [](int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); };
 
-    float x1f = floorf(X);
-    float x2f = ceilf(X);
-    float y1f = floorf(Y);
-    float y2f = ceilf(Y);
+    float x1f = floorf(X), x2f = ceilf(X);
+    float y1f = floorf(Y), y2f = ceilf(Y);
 
     int x1 = clampi((int)x1f, 0, (int)m_wDisplacementMap - 1);
     int x2 = clampi((int)x2f, 0, (int)m_wDisplacementMap - 1);
@@ -513,6 +576,7 @@ float Terrain::GetDisplacementMapValueAtPoint(float x, float y) {
     float dx = X - (float)x1f;
     float dy = Y - (float)y1f;
 
+    // берЄм альфу (канал A)
     float a = (float)m_dataDisplacementMap[(y1 * m_wDisplacementMap + x1) * 4 + 3] / 255.0f;
     float b = (float)m_dataDisplacementMap[(y1 * m_wDisplacementMap + x2) * 4 + 3] / 255.0f;
     float c = (float)m_dataDisplacementMap[(y2 * m_wDisplacementMap + x1) * 4 + 3] / 255.0f;
@@ -521,7 +585,9 @@ float Terrain::GetDisplacementMapValueAtPoint(float x, float y) {
     return bilerp(a, b, c, d, dx, dy);
 }
 
-XMFLOAT3 Terrain::CalculateNormalAtPoint(float x, float y) {
+XMFLOAT3 Terrain::CalculateNormalAtPoint(float x, float y)
+{
+    // небольшой собель по окрестности
     XMFLOAT2 b(x, y - 0.3f / m_hHeightMap);
     XMFLOAT2 c(x + 0.3f / m_wHeightMap, y - 0.3f / m_hHeightMap);
     XMFLOAT2 d(x + 0.3f / m_wHeightMap, y);
@@ -540,28 +606,34 @@ XMFLOAT3 Terrain::CalculateNormalAtPoint(float x, float y) {
     float zh = GetHeightMapValueAtPoint(h.x, h.y) * m_scaleHeightMap;
     float zi = GetHeightMapValueAtPoint(i.x, i.y) * m_scaleHeightMap;
 
-    float u = sin(zg + 2 * zh + zi - zc - 2 * zd - ze);
-    float v = 2 * zb + zc + zi - ze - 2 * zf - zg;
-    float w = 8.0f;
+    float nx = sin(zg + 2 * zh + zi - zc - 2 * zd - ze);
+    float ny = 2 * zb + zc + zi - ze - 2 * zf - zg;
+    float nz = 8.0f;
 
-    XMFLOAT3 norm(u, v, w);
-    XMVECTOR normalized = XMVector3Normalize(XMLoadFloat3(&norm));
-    XMStoreFloat3(&norm, normalized);
-    return norm;
+    XMFLOAT3 n(nx, ny, nz);
+    XMVECTOR nn = XMVector3Normalize(XMLoadFloat3(&n));
+    XMStoreFloat3(&n, nn);
+    return n;
 }
 
-float Terrain::GetHeightAtPoint(float x, float y) {
+float Terrain::GetHeightAtPoint(float x, float y)
+{
     float z = GetHeightMapValueAtPoint(x, y) * m_scaleHeightMap;
     float d = 2.0f * GetDisplacementMapValueAtPoint(x, y) - 1.0f;
-    XMFLOAT3 norm = CalculateNormalAtPoint(x, y);
-    XMFLOAT3 pos(x, y, z);
-    XMVECTOR normal = XMLoadFloat3(&norm);
-    XMVECTOR position = XMLoadFloat3(&pos);
-    XMVECTOR posFinal = position + normal * 0.5f * d;
-    XMFLOAT3 fp;
-    XMStoreFloat3(&fp, posFinal);
-    return fp.z;
+
+    XMFLOAT3 n = CalculateNormalAtPoint(x, y);
+    XMFLOAT3 p(x, y, z);
+
+    XMVECTOR nv = XMLoadFloat3(&n);
+    XMVECTOR pv = XMLoadFloat3(&p);
+    XMVECTOR pf = pv + nv * 0.5f * d;
+
+    XMFLOAT3 outP;
+    XMStoreFloat3(&outP, pf);
+    return outP.z;
 }
+
+//   квадродерево (LOD)  
 
 struct __QTNode {
     int x0, y0, x1, y1;
@@ -571,23 +643,24 @@ struct __QTNode {
     __QTNode() : x0(0), y0(0), x1(0), y1(0), level(0) { c[0] = c[1] = c[2] = c[3] = nullptr; }
 };
 
-static __QTNode* __gQT = nullptr;
-static int  __gPatchW = 0, __gPatchH = 0;
-static int  __gTessStep = 8;
+static __QTNode* s_qtRoot = nullptr;
+static int  s_patchW = 0, s_patchH = 0;
+static int  s_tessStep = 8;
 
-static void __KillQT(__QTNode* n) { if (!n) return; for (int i = 0; i < 4; i++) __KillQT(n->c[i]); delete n; }
+static void DestroyQT(__QTNode* n) { if (!n) return; for (int i = 0; i < 4; i++) DestroyQT(n->c[i]); delete n; }
 
-void Terrain::BuildQT() {
-    __KillQT(__gQT); __gQT = nullptr;
+void Terrain::BuildQT()
+{
+    DestroyQT(s_qtRoot); s_qtRoot = nullptr;
 
-    __gTessStep = TerrainTessStep();
-    __gPatchW = max(1, (int)(m_wHeightMap / __gTessStep));
-    __gPatchH = max(1, (int)(m_hHeightMap / __gTessStep));
+    s_tessStep = G_TerrainTess();
+    s_patchW = max(1, (int)(m_wHeightMap / s_tessStep));
+    s_patchH = max(1, (int)(m_hHeightMap / s_tessStep));
 
     auto calcZ = [&](int x0, int y0, int x1, int y1)->XMFLOAT2 {
-        int px0 = x0 * __gTessStep, py0 = y0 * __gTessStep;
-        int px1 = min(m_wHeightMap - 1, x1 * __gTessStep - 1);
-        int py1 = min(m_hHeightMap - 1, y1 * __gTessStep - 1);
+        int px0 = x0 * s_tessStep, py0 = y0 * s_tessStep;
+        int px1 = min(m_wHeightMap - 1, x1 * s_tessStep - 1);
+        int py1 = min(m_hHeightMap - 1, y1 * s_tessStep - 1);
 
         float zmin = +FLT_MAX, zmax = -FLT_MAX;
         for (int y = py0; y <= py1; ++y)
@@ -600,39 +673,41 @@ void Terrain::BuildQT() {
         };
 
     std::function<__QTNode* (int, int, int, int, int)> build =
-        [&](int x0, int y0, int x1, int y1, int lvl)->__QTNode* {
-        __QTNode* n = new __QTNode(); n->x0 = x0; n->y0 = y0; n->x1 = x1; n->y1 = y1; n->level = lvl;
+        [&](int x0, int y0, int x1, int y1, int lvl)->__QTNode*
+        {
+            __QTNode* n = new __QTNode(); n->x0 = x0; n->y0 = y0; n->x1 = x1; n->y1 = y1; n->level = lvl;
 
-        XMFLOAT2 bz = calcZ(x0, y0, x1, y1);
-        n->aabbMin = XMFLOAT3((float)(x0 * __gTessStep), (float)(y0 * __gTessStep), bz.x);
-        n->aabbMax = XMFLOAT3((float)(x1 * __gTessStep), (float)(y1 * __gTessStep), bz.y);
+            XMFLOAT2 bz = calcZ(x0, y0, x1, y1);
+            n->aabbMin = XMFLOAT3((float)(x0 * s_tessStep), (float)(y0 * s_tessStep), bz.x);
+            n->aabbMax = XMFLOAT3((float)(x1 * s_tessStep), (float)(y1 * s_tessStep), bz.y);
 
-        if ((x1 - x0) <= 1 && (y1 - y0) <= 1) return n;
+            if ((x1 - x0) <= 1 && (y1 - y0) <= 1) return n;
 
-        int mx = (x0 + x1) / 2, my = (y0 + y1) / 2;
-        if (mx == x0 && x1 - x0 > 1) mx = x0 + 1;
-        if (my == y0 && y1 - y0 > 1) my = y0 + 1;
+            int mx = (x0 + x1) / 2, my = (y0 + y1) / 2;
+            if (mx == x0 && x1 - x0 > 1) mx = x0 + 1;
+            if (my == y0 && y1 - y0 > 1) my = y0 + 1;
 
-        n->c[0] = (x0 < mx && y0 < my) ? build(x0, y0, mx, my, lvl + 1) : nullptr;
-        n->c[1] = (mx < x1 && y0 < my) ? build(mx, y0, x1, my, lvl + 1) : nullptr;
-        n->c[2] = (x0 < mx && my < y1) ? build(x0, my, mx, y1, lvl + 1) : nullptr;
-        n->c[3] = (mx < x1 && my < y1) ? build(mx, my, x1, y1, lvl + 1) : nullptr;
+            n->c[0] = (x0 < mx && y0 < my) ? build(x0, y0, mx, my, lvl + 1) : nullptr;
+            n->c[1] = (mx < x1 && y0 < my) ? build(mx, y0, x1, my, lvl + 1) : nullptr;
+            n->c[2] = (x0 < mx && my < y1) ? build(x0, my, mx, y1, lvl + 1) : nullptr;
+            n->c[3] = (mx < x1 && my < y1) ? build(mx, my, x1, y1, lvl + 1) : nullptr;
 
-        for (int k = 0; k < 4; k++) if (n->c[k]) {
-            n->aabbMin.x = min(n->aabbMin.x, n->c[k]->aabbMin.x);
-            n->aabbMin.y = min(n->aabbMin.y, n->c[k]->aabbMin.y);
-            n->aabbMin.z = min(n->aabbMin.z, n->c[k]->aabbMin.z);
-            n->aabbMax.x = max(n->aabbMax.x, n->c[k]->aabbMax.x);
-            n->aabbMax.y = max(n->aabbMax.y, n->c[k]->aabbMax.y);
-            n->aabbMax.z = max(n->aabbMax.z, n->c[k]->aabbMax.z);
-        }
-        return n;
+            for (int k = 0; k < 4; k++) if (n->c[k]) {
+                n->aabbMin.x = min(n->aabbMin.x, n->c[k]->aabbMin.x);
+                n->aabbMin.y = min(n->aabbMin.y, n->c[k]->aabbMin.y);
+                n->aabbMin.z = min(n->aabbMin.z, n->c[k]->aabbMin.z);
+                n->aabbMax.x = max(n->aabbMax.x, n->c[k]->aabbMax.x);
+                n->aabbMax.y = max(n->aabbMax.y, n->c[k]->aabbMax.y);
+                n->aabbMax.z = max(n->aabbMax.z, n->c[k]->aabbMax.z);
+            }
+            return n;
         };
 
-    __gQT = build(0, 0, __gPatchW, __gPatchH, 0);
+    s_qtRoot = build(0, 0, s_patchW, s_patchH, 0);
 }
 
-static inline float __dist2(const XMFLOAT3& a, const XMFLOAT3& b) {
+static inline float dist2(const XMFLOAT3& a, const XMFLOAT3& b)
+{
     float dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
     return dx * dx + dy * dy + dz * dz;
 }
@@ -640,11 +715,7 @@ static inline float __dist2(const XMFLOAT3& a, const XMFLOAT3& b) {
 void Terrain::SelectQT(const DirectX::XMFLOAT3& eye, std::vector<DirectX::XMFLOAT4>& outBoxes) const
 {
     outBoxes.clear();
-    if (!__gQT) return;
-
-    auto isLeaf = [](__QTNode* n) -> bool {
-        return !(n->c[0] || n->c[1] || n->c[2] || n->c[3]);
-        };
+    if (!s_qtRoot) return;
 
     auto shouldSplit = [&](const __QTNode* n) -> bool {
         float cx = 0.5f * (n->aabbMin.x + n->aabbMax.x);
@@ -654,16 +725,17 @@ void Terrain::SelectQT(const DirectX::XMFLOAT3& eye, std::vector<DirectX::XMFLOA
         float R = max(ex, ey);
 
         float dx = eye.x - cx, dy = eye.y - cy;
-        float dist = sqrt(dx * dx + dy * dy) + 1e-3f;
+        float dist = sqrtf(dx * dx + dy * dy) + 1e-3f;
 
         const float k = 2.0f;
-        const float minSize = 4.0f * __gTessStep;
+        const float minSize = 4.0f * s_tessStep;
         return (R > minSize) && (dist < k * R);
         };
 
     std::function<void(__QTNode*)> walk = [&](__QTNode* n)
         {
-            if (!(n->c[0] || n->c[1] || n->c[2] || n->c[3]) == false && shouldSplit(n)) {
+            const bool hasChildren = (n->c[0] || n->c[1] || n->c[2] || n->c[3]);
+            if (hasChildren && shouldSplit(n)) {
                 for (int i = 0; i < 4; ++i) if (n->c[i]) walk(n->c[i]);
                 return;
             }
@@ -673,7 +745,7 @@ void Terrain::SelectQT(const DirectX::XMFLOAT3& eye, std::vector<DirectX::XMFLOA
             );
         };
 
-    walk(__gQT);
+    walk(s_qtRoot);
 }
 
 #define LOD_DEBUG 1
@@ -705,8 +777,8 @@ void Terrain::DrawLOD(ID3D12GraphicsCommandList* cmdList, const DirectX::XMFLOAT
 #if LOD_DEBUG
     if (doLog)
     {
-        const int cellsX = max(0, __gPatchW - 1);
-        const int cellsY = max(0, __gPatchH - 1);
+        const int cellsX = max(0, s_patchW - 1);
+        const int cellsY = max(0, s_patchH - 1);
         const int totalPatches = cellsX * cellsY;
 
         auto clampi = [](int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); };
@@ -719,17 +791,17 @@ void Terrain::DrawLOD(ID3D12GraphicsCommandList* cmdList, const DirectX::XMFLOAT
 
         LOGF(
             "\n[LOD] frame=%d | eye=(%.1f, %.1f, %.1f) | tessStep=%d | grid=%dx%d patches=%d | boxes=%zu\n",
-            s_frame, eye.x, eye.y, eye.z, __gTessStep, cellsX, cellsY, totalPatches, boxes.size()
+            s_frame, eye.x, eye.y, eye.z, s_tessStep, cellsX, cellsY, totalPatches, boxes.size()
         );
 
         const int PREVIEW = 5;
         for (size_t i = 0; i < boxes.size(); ++i)
         {
             const auto& b = boxes[i];
-            int vx0 = (int)floorf(b.x / (float)__gTessStep);
-            int vy0 = (int)floorf(b.y / (float)__gTessStep);
-            int vx1 = (int)ceilf(b.z / (float)__gTessStep);
-            int vy1 = (int)ceilf(b.w / (float)__gTessStep);
+            int vx0 = (int)floorf(b.x / (float)s_tessStep);
+            int vy0 = (int)floorf(b.y / (float)s_tessStep);
+            int vx1 = (int)ceilf(b.z / (float)s_tessStep);
+            int vy1 = (int)ceilf(b.w / (float)s_tessStep);
 
             int x0 = clampi(vx0, 0, cellsX);
             int y0 = clampi(vy0, 0, cellsY);
