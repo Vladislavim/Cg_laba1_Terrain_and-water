@@ -82,7 +82,7 @@ namespace window {
 		UpdateWindow(m_Window);
 
 		// как в оригинальном проекте Ч курсор пр€чем, чтобы не мешал
-		ShowCursor(true);
+		ShowCursor(false);
 	}
 
 	Window::~Window() {

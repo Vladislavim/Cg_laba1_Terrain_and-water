@@ -10,286 +10,279 @@ struct LightData
     float sexp;
 };
 
-cbuffer TerrainData : register(b0)
+cbuffer TerrainCB : register(b0)
 {
-    float scale;
-    float width;
-    float depth;
-    float base;
+    float scaleVal;
+    float worldW;
+    float worldD;
+    float worldBase;
 }
 
-cbuffer PerFrameData : register(b1)
+cbuffer FrameCB : register(b1)
 {
-    float4x4 viewproj;
-    float4x4 shadowtexmatrices[4];
-    float4 eye;
-    float4 frustum[6];
+    float4x4 vpMat;
+    float4x4 shadowMats[4];
+    float4 eyePos;
+    float4 frust[6];
     LightData light;
-    bool useTextures;
+    bool useTex;
 }
 
-Texture2D<float4> heightmap : register(t0);
-Texture2D<float4> displacementmap : register(t1);
-Texture2D<float> shadowmap : register(t2);
-Texture2DArray<float4> detailmaps : register(t3);
+Texture2D<float4> hmTex : register(t0);
+Texture2D<float4> dispTex : register(t1);
+Texture2D<float> shTex : register(t2);
+Texture2DArray<float4> detTex : register(t3);
 
-SamplerState hmsampler : register(s0);
-SamplerComparisonState shadowsampler : register(s2);
-SamplerState displacementsampler : register(s3);
+SamplerState hmSamp : register(s0);
+SamplerComparisonState shSamp : register(s2);
+SamplerState dispSamp : register(s3);
 
-struct DS_OUTPUT
+struct PS_IN
 {
     float4 pos : SV_POSITION;
-    float4 shadowpos[4] : TEXCOORD0;
-    float3 worldpos : POSITION;
+    float4 shpos[4] : TEXCOORD0;
+    float3 wpos : POSITION;
 };
 
-// shadow map constants
+// тени
 static const float SMAP_SIZE = 4096.0f;
 static const float SMAP_DX = 1.0f / SMAP_SIZE;
-static const float4 colors[] = { { 0.35f, 0.5f, 0.18f, 1.0f }, { 0.89f, 0.89f, 0.89f, 1.0f }, { 0.31f, 0.25f, 0.2f, 1.0f }, { 0.39f, 0.37f, 0.38f, 1.0f } };
-
-
-float3x3 cotangent_frame(float3 N, float3 p, float2 uv)
+static const float4 cols[] =
 {
-	// get edge vectors of the pixel triangle
+    float4(0.35f, 0.50f, 0.18f, 1.0f),
+    float4(0.89f, 0.89f, 0.89f, 1.0f),
+    float4(0.31f, 0.25f, 0.20f, 1.0f),
+    float4(0.39f, 0.37f, 0.38f, 1.0f)
+};
+
+// локальная рамка
+float3x3 getFrame(float3 N, float3 p, float2 uv)
+{
     float3 dp1 = ddx(p);
     float3 dp2 = ddy(p);
-    float2 duv1 = ddx(uv);
-    float2 duv2 = ddy(uv);
+    float2 du1 = ddx(uv);
+    float2 du2 = ddy(uv);
 
-	// solve the linear system
-    float3 dp2perp = cross(dp2, N);
-    float3 dp1perp = cross(N, dp1);
-    float3 T = dp2perp * duv1.x + dp1perp * duv2.x;
-    float3 B = dp2perp * duv1.y + dp1perp * duv2.y;
+    float3 dp2p = cross(dp2, N);
+    float3 dp1p = cross(N, dp1);
+    float3 T = dp2p * du1.x + dp1p * du2.x;
+    float3 B = dp2p * du1.y + dp1p * du2.y;
 
-	// construct a scale-invariant frame
-    float invmax = rsqrt(max(dot(T, T), dot(B, B)));
-    return float3x3(T * invmax, B * invmax, N);
+    float invm = rsqrt(max(dot(T, T), dot(B, B)));
+    return float3x3(T * invm, B * invm, N);
 }
 
-float3 perturb_normal(float3 N, float3 V, float2 texcoord, Texture2D tex, SamplerState sam)
+// возмущение нормали
+float3 perturbN(float3 N, float3 V, float2 uv, Texture2D tex, SamplerState smp)
 {
-	// assume N, the interpolated vertex normal and
-	// V, the view vector (vertex to eye)
-    float3 map = 2.0f * tex.Sample(sam, texcoord.xy).xyz - 1.0f;
-    map.z *= 2.0f; // scale normal as displacement height is scaled by 0.5
-    float3x3 TBN = cotangent_frame(N, -V, texcoord.xy);
+    float3 map = 2.0f * tex.Sample(smp, uv).xyz - 1.0f;
+    map.z *= 2.0f; // чутка выше
+    float3x3 TBN = getFrame(N, -V, uv);
     return normalize(mul(map, TBN));
 }
 
-float4 SampleDetailTriplanar(float3 uvw, float3 N, float index)
+// трипланар выборка
+float4 sampleTri(float3 uvw, float3 N, float idx)
 {
-    // гладкие веса вместо saturate(abs(N) - tighten)
     float3 an = abs(N) + 1e-5;
-    float3 w = pow(an, 8.0); // 4..8 — подберёшь по вкусу
+    float3 w = pow(an, 8.0);
     w /= (w.x + w.y + w.z);
 
-    float4 x = detailmaps.Sample(displacementsampler, float3(uvw.yz, index));
-    float4 y = detailmaps.Sample(displacementsampler, float3(uvw.xz, index));
-    float4 z = detailmaps.Sample(displacementsampler, float3(uvw.xy, index));
-    return x * w.x + y * w.y + z * w.z;
+    float4 tx = detTex.Sample(dispSamp, float3(uvw.yz, idx));
+    float4 ty = detTex.Sample(dispSamp, float3(uvw.xz, idx));
+    float4 tz = detTex.Sample(dispSamp, float3(uvw.xy, idx));
+    return tx * w.x + ty * w.y + tz * w.z;
 }
 
-float4 Blend(float4 tex1, float blend1, float4 tex2, float blend2)
+// мягкое смешивание по альфе
+float4 blendTex(float4 t1, float b1, float4 t2, float b2)
 {
     float depth = 0.2f;
-
-    float ma = max(tex1.a + blend1, tex2.a + blend2) - depth;
-
-    float b1 = max(tex1.a + blend1 - ma, 0);
-    float b2 = max(tex2.a + blend2 - ma, 0);
-
-    return (tex1 * b1 + tex2 * b2) / (b1 + b2);
+    float ma = max(t1.a + b1, t2.a + b2) - depth;
+    float bb1 = max(t1.a + b1 - ma, 0);
+    float bb2 = max(t2.a + b2 - ma, 0);
+    return (t1 * bb1 + t2 * bb2) / (bb1 + bb2);
 }
 
-float4 GetTexByHeightPlanar(float height, float3 uvw, float low, float med, float high)
+// по высоте (планар)
+float4 getTexHeightPlanar(float height, float3 uvw, float low, float med, float high)
 {
-    float bounds = scale * 0.005f;
-    float transition = scale * 0.6f;
-    float lowBlendStart = transition - 2 * bounds;
-    float highBlendEnd = transition + 2 * bounds;
+    float bounds = scaleVal * 0.005f;
+    float transition = scaleVal * 0.6f;
+    float lowStart = transition - 2 * bounds;
+    float highEnd = transition + 2 * bounds;
     float4 c;
 
-    if (height < lowBlendStart)
+    if (height < lowStart)
     {
-        c = detailmaps.Sample(displacementsampler, float3(uvw.xy, low));
+        c = detTex.Sample(dispSamp, float3(uvw.xy, low));
     }
     else if (height < transition)
     {
-        float4 c1 = detailmaps.Sample(displacementsampler, float3(uvw.xy, low));
-        float4 c2 = detailmaps.Sample(displacementsampler, float3(uvw.xy, med));
-
-        float blend = (height - lowBlendStart) * (1.0f / (transition - lowBlendStart));
-		
-        c = Blend(c1, 1 - blend, c2, blend);
+        float4 c1 = detTex.Sample(dispSamp, float3(uvw.xy, low));
+        float4 c2 = detTex.Sample(dispSamp, float3(uvw.xy, med));
+        float blend = (height - lowStart) / (transition - lowStart);
+        c = blendTex(c1, 1 - blend, c2, blend);
     }
-    else if (height < highBlendEnd)
+    else if (height < highEnd)
     {
-        float4 c1 = detailmaps.Sample(displacementsampler, float3(uvw.xy, med));
-        float4 c2 = detailmaps.Sample(displacementsampler, float3(uvw.xy, high));
-
-        float blend = (height - transition) * (1.0f / (highBlendEnd - transition));
-		
-        c = Blend(c1, 1 - blend, c2, blend);
+        float4 c1 = detTex.Sample(dispSamp, float3(uvw.xy, med));
+        float4 c2 = detTex.Sample(dispSamp, float3(uvw.xy, high));
+        float blend = (height - transition) / (highEnd - transition);
+        c = blendTex(c1, 1 - blend, c2, blend);
     }
     else
     {
-        c = detailmaps.Sample(displacementsampler, float3(uvw.xy, high));
+        c = detTex.Sample(dispSamp, float3(uvw.xy, high));
     }
-
     return c;
 }
 
-float4 GetTexByHeightTriplanar(float height, float3 uvw, float3 N, float index1, float index2)
+// по высоте (трипланар)
+float4 getTexHeightTri(float height, float3 uvw, float3 N, float idx1, float idx2)
 {
-    float bounds = scale * 0.005f;
-    float transition = scale * 0.6f;
-    float blendStart = transition - bounds;
-    float blendEnd = transition + bounds;
+    float bounds = scaleVal * 0.005f;
+    float transition = scaleVal * 0.6f;
+    float bStart = transition - bounds;
+    float bEnd = transition + bounds;
     float4 c;
 
-    if (height < blendStart)
+    if (height < bStart)
     {
-        c = SampleDetailTriplanar(uvw, N, index1);
+        c = sampleTri(uvw, N, idx1);
     }
-    else if (height < blendEnd)
+    else if (height < bEnd)
     {
-        float4 c1 = SampleDetailTriplanar(uvw, N, index1);
-        float4 c2 = SampleDetailTriplanar(uvw, N, index2);
-        float blend = (height - blendStart) * (1.0f / (blendEnd - blendStart));
-		
-        c = Blend(c1, 1 - blend, c2, blend);
+        float4 c1 = sampleTri(uvw, N, idx1);
+        float4 c2 = sampleTri(uvw, N, idx2);
+        float blend = (height - bStart) / (bEnd - bStart);
+        c = blendTex(c1, 1 - blend, c2, blend);
     }
     else
     {
-        c = SampleDetailTriplanar(uvw, N, index2);
+        c = sampleTri(uvw, N, idx2);
     }
-
     return c;
 }
 
-float4 GetColorByHeight(float height, float low, float med, float high)
+// просто цвет по высоте
+float4 getColorHeight(float height, float low, float med, float high)
 {
-    float bounds = scale * 0.005f;
-    float transition = scale * 0.6f;
-    float lowBlendStart = transition - 2 * bounds;
-    float highBlendEnd = transition + 2 * bounds;
+    float bounds = scaleVal * 0.005f;
+    float transition = scaleVal * 0.6f;
+    float lowStart = transition - 2 * bounds;
+    float highEnd = transition + 2 * bounds;
     float4 c;
 
-    if (height < lowBlendStart)
+    if (height < lowStart)
     {
-        c = colors[low];
+        c = cols[low];
     }
     else if (height < transition)
     {
-        float4 c1 = colors[low];
-        float4 c2 = colors[med];
-
-        float blend = (height - lowBlendStart) * (1.0f / (transition - lowBlendStart));
-
+        float4 c1 = cols[low];
+        float4 c2 = cols[med];
+        float blend = (height - lowStart) / (transition - lowStart);
         c = lerp(c1, c2, blend);
     }
-    else if (height < highBlendEnd)
+    else if (height < highEnd)
     {
-        float4 c1 = colors[med];
-        float4 c2 = colors[high];
-
-        float blend = (height - transition) * (1.0f / (highBlendEnd - transition));
-
+        float4 c1 = cols[med];
+        float4 c2 = cols[high];
+        float blend = (height - transition) / (highEnd - transition);
         c = lerp(c1, c2, blend);
     }
     else
     {
-        c = colors[high];
+        c = cols[high];
     }
-
     return c;
 }
 
-float3 GetTexBySlope(float slope, float height, float3 N, float3 uvw, float startingIndex)
+// текстуры по уклону
+float3 getTexSlope(float slope, float height, float3 N, float3 uvw, float startIdx)
 {
     float4 c;
     float blend;
     if (slope < 0.6f)
     {
         blend = slope / 0.6f;
-        float4 c1 = GetTexByHeightPlanar(height, uvw, 0 + startingIndex, 3 + startingIndex, 1 + startingIndex);
-        float4 c2 = GetTexByHeightTriplanar(height, uvw, N, 2 + startingIndex, 3 + startingIndex);
-        c = Blend(c1, 1 - blend, c2, blend);
+        float4 c1 = getTexHeightPlanar(height, uvw, 0 + startIdx, 3 + startIdx, 1 + startIdx);
+        float4 c2 = getTexHeightTri(height, uvw, N, 2 + startIdx, 3 + startIdx);
+        c = blendTex(c1, 1 - blend, c2, blend);
     }
     else if (slope < 0.65f)
     {
-        blend = (slope - 0.6f) * (1.0f / (0.65f - 0.6f));
-        float4 c1 = GetTexByHeightTriplanar(height, uvw, N, 2 + startingIndex, 3 + startingIndex);
-        float4 c2 = SampleDetailTriplanar(uvw, N, 3 + startingIndex);
-        c = Blend(c1, 1 - blend, c2, blend);
+        blend = (slope - 0.6f) / (0.65f - 0.6f);
+        float4 c1 = getTexHeightTri(height, uvw, N, 2 + startIdx, 3 + startIdx);
+        float4 c2 = sampleTri(uvw, N, 3 + startIdx);
+        c = blendTex(c1, 1 - blend, c2, blend);
     }
     else
     {
-        c = SampleDetailTriplanar(uvw, N, 3 + startingIndex);
+        c = sampleTri(uvw, N, 3 + startIdx);
     }
-
     return c.rgb;
 }
 
-float4 GetColorBySlope(float slope, float height)
+// цвета по уклону
+float4 getColorSlope(float slope, float height)
 {
     float4 c;
     float blend;
     if (slope < 0.6f)
     {
         blend = slope / 0.6f;
-        float4 c1 = GetColorByHeight(height, 0, 3, 1);
-        float4 c2 = GetColorByHeight(height, 2, 3, 3);
+        float4 c1 = getColorHeight(height, 0, 3, 1);
+        float4 c2 = getColorHeight(height, 2, 3, 3);
         c = lerp(c1, c2, blend);
     }
     else if (slope < 0.65f)
     {
-        blend = (slope - 0.6f) * (1.0f / (0.65f - 0.6f));
-        float4 c1 = GetColorByHeight(height, 2, 3, 3);
-        float4 c2 = colors[3];
+        blend = (slope - 0.6f) / (0.65f - 0.6f);
+        float4 c1 = getColorHeight(height, 2, 3, 3);
+        float4 c2 = cols[3];
         c = lerp(c1, c2, blend);
     }
     else
     {
-        c = colors[3];
+        c = cols[3];
     }
-
     return c;
 }
 
-float3 PerturbNormalByHeightSlope(float height, float slope, float3 N, float3 V, float3 uvw)
+// нормаль, зависящая от высоты/уклона
+float3 perturbNHeightSlope(float height, float slope, float3 N, float3 V, float3 uvw)
 {
-    float3 c = GetTexBySlope(slope, height, N, uvw, 0) - 0.5f;
-
-    float3x3 TBN = cotangent_frame(N, -V, uvw);
+    float3 c = getTexSlope(slope, height, N, uvw, 0) - 0.5f;
+    float3x3 TBN = getFrame(N, -V, uvw);
     return normalize(mul(c, TBN));
 }
 
-float4 dist_based_texturing(float height, float slope, float3 N, float3 V, float3 uvw)
+// текстуры по дистанции
+float4 distTexturing(float height, float slope, float3 N, float3 V, float3 uvw)
 {
     float dist = length(V);
 
     if (dist > 75)
-        return GetColorBySlope(slope, height);
+        return getColorSlope(slope, height);
     else if (dist > 25)
     {
-        float blend = (dist - 25.0f) * (1.0f / (75.0f - 25.0f));
-        float4 c1 = float4(GetTexBySlope(slope, height, N, uvw, 4), 1);
-        float4 c2 = GetColorBySlope(slope, height);
+        float blend = (dist - 25.0f) / (75.0f - 25.0f);
+        float4 c1 = float4(getTexSlope(slope, height, N, uvw, 4), 1);
+        float4 c2 = getColorSlope(slope, height);
         return lerp(c1, c2, blend);
     }
     else
-        return float4(GetTexBySlope(slope, height, N, uvw, 4), 1);
+        return float4(getTexSlope(slope, height, N, uvw, 4), 1);
 }
 
-float3 dist_based_normal(float height, float slope, float3 N, float3 V, float3 uvw)
+// нормали по дистанции
+float3 distNormal(float height, float slope, float3 N, float3 V, float3 uvw)
 {
     float dist = length(V);
 
-    float3 N1 = perturb_normal(N, V, uvw / 16, displacementmap, displacementsampler);
+    float3 N1 = perturbN(N, V, uvw / 16, dispTex, dispSamp);
 	
     if (dist > 150)
         return N;
@@ -297,11 +290,10 @@ float3 dist_based_normal(float height, float slope, float3 N, float3 V, float3 u
     if (dist > 100)
     {
         float blend = (dist - 100.0f) / 50.0f;
-
         return lerp(N1, N, blend);
     }
 
-    float3 N2 = PerturbNormalByHeightSlope(height, slope, N1, V, uvw);
+    float3 N2 = perturbNHeightSlope(height, slope, N1, V, uvw);
 
     if (dist > 50)
         return N1;
@@ -309,32 +301,32 @@ float3 dist_based_normal(float height, float slope, float3 N, float3 V, float3 u
     if (dist > 25)
     {
         float blend = (dist - 25.0f) / 25.0f;
-
         return lerp(N2, N1, blend);
     }
 
     return N2;
 }
 
-float3 estimateNormal(float2 texcoord)
+// нормаль из карты высот (собель)
+float3 estimateN(float2 tc)
 {
-    float2 b = texcoord + float2(0.0f, -0.3f / depth);
-    float2 c = texcoord + float2(0.3f / width, -0.3f / depth);
-    float2 d = texcoord + float2(0.3f / width, 0.0f);
-    float2 e = texcoord + float2(0.3f / width, 0.3f / depth);
-    float2 f = texcoord + float2(0.0f, 0.3f / depth);
-    float2 g = texcoord + float2(-0.3f / width, 0.3f / depth);
-    float2 h = texcoord + float2(-0.3f / width, 0.0f);
-    float2 i = texcoord + float2(-0.3f / width, -0.3f / depth);
+    float2 b = tc + float2(0.0f, -0.3f / worldD);
+    float2 c = tc + float2(0.3f / worldW, -0.3f / worldD);
+    float2 d = tc + float2(0.3f / worldW, 0.0f);
+    float2 e = tc + float2(0.3f / worldW, 0.3f / worldD);
+    float2 f = tc + float2(0.0f, 0.3f / worldD);
+    float2 g = tc + float2(-0.3f / worldW, 0.3f / worldD);
+    float2 h = tc + float2(-0.3f / worldW, 0.0f);
+    float2 i = tc + float2(-0.3f / worldW, -0.3f / worldD);
 
-    float zb = heightmap.SampleLevel(hmsampler, b, 0).x * scale;
-    float zc = heightmap.SampleLevel(hmsampler, c, 0).x * scale;
-    float zd = heightmap.SampleLevel(hmsampler, d, 0).x * scale;
-    float ze = heightmap.SampleLevel(hmsampler, e, 0).x * scale;
-    float zf = heightmap.SampleLevel(hmsampler, f, 0).x * scale;
-    float zg = heightmap.SampleLevel(hmsampler, g, 0).x * scale;
-    float zh = heightmap.SampleLevel(hmsampler, h, 0).x * scale;
-    float zi = heightmap.SampleLevel(hmsampler, i, 0).x * scale;
+    float zb = hmTex.SampleLevel(hmSamp, b, 0).x * scaleVal;
+    float zc = hmTex.SampleLevel(hmSamp, c, 0).x * scaleVal;
+    float zd = hmTex.SampleLevel(hmSamp, d, 0).x * scaleVal;
+    float ze = hmTex.SampleLevel(hmSamp, e, 0).x * scaleVal;
+    float zf = hmTex.SampleLevel(hmSamp, f, 0).x * scaleVal;
+    float zg = hmTex.SampleLevel(hmSamp, g, 0).x * scaleVal;
+    float zh = hmTex.SampleLevel(hmSamp, h, 0).x * scaleVal;
+    float zi = hmTex.SampleLevel(hmSamp, i, 0).x * scaleVal;
 
     float x = zg + 2 * zh + zi - zc - 2 * zd - ze;
     float y = 2 * zb + zc + zi - ze - 2 * zf - zg;
@@ -343,75 +335,63 @@ float3 estimateNormal(float2 texcoord)
     return normalize(float3(x, y, z));
 }
 
-float calcShadowFactor(float4 shadowPosH)
+// pcf 3x3
+float calcShadow(float4 shPosH)
 {
-	// No need to divide shadowPosH.xyz by shadowPosH.w because we only have a directional light.
-	
-	// Depth in NDC space.
-    float depth = shadowPosH.z;
-
-	// Texel size.
+    float depth = shPosH.z;
     const float dx = SMAP_DX;
 
-    float percentLit = 0.0f;
-	
-    const float2 offsets[9] =
+    float percent = 0.0f;
+    const float2 offs[9] =
     {
-        float2(-dx, -dx), float2(0.0f, -dx), float2(dx, -dx),
-		float2(-dx, 0.0f), float2(0.0f, 0.0f), float2(dx, 0.0f),
-		float2(-dx, dx), float2(0.0f, dx), float2(dx, dx)
+        float2(-dx, -dx), float2(0, -dx), float2(dx, -dx),
+        float2(-dx, 0), float2(0, 0), float2(dx, 0),
+        float2(-dx, dx), float2(0, dx), float2(dx, dx)
     };
 
-	// 3x3 box filter pattern. Each sample does a 4-tap PCF.
-	[unroll]
+    [unroll]
     for (int i = 0; i < 9; ++i)
-    {
-        percentLit += shadowmap.SampleCmpLevelZero(shadowsampler, shadowPosH.xy + offsets[i], depth);
-    }
+        percent += shTex.SampleCmpLevelZero(shSamp, shPosH.xy + offs[i], depth);
 
-	// average the samples.
-    return percentLit / 9.0f;
+    return percent / 9.0f;
 }
 
-float decideOnCascade(float4 shadowpos[4])
+// выбор каскада
+float pickCascade(float4 shpos[4])
 {
-	// if shadowpos[0].xy is in the range [0, 0.5], then this point is in the first cascade
-    if (max(abs(shadowpos[0].x - 0.25), abs(shadowpos[0].y - 0.25)) < 0.247)
-    {
-        return calcShadowFactor(shadowpos[0]);
-    }
-
-    if (max(abs(shadowpos[1].x - 0.25), abs(shadowpos[1].y - 0.75)) < 0.247)
-    {
-        return calcShadowFactor(shadowpos[1]);
-    }
-
-    if (max(abs(shadowpos[2].x - 0.75), abs(shadowpos[2].y - 0.25)) < 0.247)
-    {
-        return calcShadowFactor(shadowpos[2]);
-    }
-	
-    return calcShadowFactor(shadowpos[3]);
+    if (max(abs(shpos[0].x - 0.25), abs(shpos[0].y - 0.25)) < 0.247)
+        return calcShadow(shpos[0]);
+    if (max(abs(shpos[1].x - 0.25), abs(shpos[1].y - 0.75)) < 0.247)
+        return calcShadow(shpos[1]);
+    if (max(abs(shpos[2].x - 0.75), abs(shpos[2].y - 0.25)) < 0.247)
+        return calcShadow(shpos[2]);
+    return calcShadow(shpos[3]);
 }
 
-// basic diffuse/ambient lighting
-float4 main(DS_OUTPUT input) : SV_TARGET
+// основной пиксельный
+float4 main(PS_IN I) : SV_TARGET
 {
-    float3 norm = estimateNormal(input.worldpos / width);
-    float3 viewvector = eye.xyz - input.worldpos;
-	
-    norm = dist_based_normal(input.worldpos.z, acos(norm.z), norm, viewvector, input.worldpos / 2);
-    float4 color;
-    if (useTextures)
-        color = dist_based_texturing(input.worldpos.z, acos(norm.z), norm, viewvector, input.worldpos / 2);
+    float3 Nhm = estimateN(I.wpos / worldW);
+    float3 Vdir = eyePos.xyz - I.wpos;
+
+    float slope = acos(Nhm.z);
+    float3 N = distNormal(I.wpos.z, slope, Nhm, Vdir, I.wpos / 2);
+
+    float4 col;
+    if (useTex)
+        col = distTexturing(I.wpos.z, slope, N, Vdir, I.wpos / 2);
     else
-        color = GetColorBySlope(acos(norm.z), input.worldpos.z);
+        col = getColorSlope(slope, I.wpos.z);
 
-    float shadowfactor = 1.0f;
-    float4 diffuse = max(shadowfactor, light.amb) * light.dif * dot(-light.dir, norm);
-    float3 V = reflect(light.dir, norm);
-    float3 toEye = normalize(eye.xyz - input.worldpos);
-    float4 specular = shadowfactor * 0.1f * light.spec * pow(max(dot(V, toEye), 0.0f), 2.0f);
-	
-    return (diffuse + specular) * color;
+    float shadowFactor = 1.0f; // если надо — заменить на pickCascade(I.shpos)
+
+    float ndl = dot(-light.dir, N);
+    float4 diff = max(shadowFactor, light.amb) * light.dif * ndl;
+
+    float3 R = reflect(light.dir, N);
+    float3 toEye = normalize(eyePos.xyz - I.wpos);
+    float specPow = pow(max(dot(R, toEye), 0.0f), 2.0f);
+    float4 spec = shadowFactor * 0.1f * light.spec * specPow;
+
+    return (diff + spec) * col;
 }

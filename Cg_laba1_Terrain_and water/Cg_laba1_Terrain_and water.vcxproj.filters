@@ -54,9 +54,6 @@
     <ClCompile Include="Water.cpp">
       <Filter>Исходные файлы</Filter>
     </ClCompile>
-    <ClCompile Include="Window.cpp">
-      <Filter>Исходные файлы</Filter>
-    </ClCompile>
     <ClCompile Include="DirectionalLight.cpp">
       <Filter>Исходные файлы</Filter>
     </ClCompile>
