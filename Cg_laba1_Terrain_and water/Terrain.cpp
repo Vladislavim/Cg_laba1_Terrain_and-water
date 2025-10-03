@@ -16,7 +16,7 @@
 // общий шаг тесселяции (храним в статике)
 static int& G_TerrainTess()
 {
-    static int g_tess = 8;
+    static int g_tess = 32;
     return g_tess;
 }
 

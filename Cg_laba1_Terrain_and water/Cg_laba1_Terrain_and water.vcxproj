@@ -150,6 +150,7 @@
     <ClCompile Include="Frame.cpp" />
     <ClCompile Include="Graphics.cpp" />
     <ClCompile Include="Light.cpp" />
+    <ClCompile Include="LoadDDS.cpp" />
     <ClCompile Include="lodepng.cpp" />
     <ClCompile Include="Main.cpp" />
     <ClCompile Include="Material.cpp" />
@@ -168,6 +169,7 @@
     <ClInclude Include="Frame.h" />
     <ClInclude Include="Graphics.h" />
     <ClInclude Include="Light.h" />
+    <ClInclude Include="LoadDDS.h" />
     <ClInclude Include="lodepng.h" />
     <ClInclude Include="Material.h" />
     <ClInclude Include="ResourceManager.h" />

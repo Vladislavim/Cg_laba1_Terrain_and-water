@@ -4,12 +4,13 @@
 #include <windows.h>
 #include <cstdio>
 #include <iostream>
+#include <chrono>
 
 using namespace std;
 using namespace graphics;
 using namespace window;
 
-static const LPCWSTR	appName = L"terrain render";
+static const LPCWSTR	appName = L"adskii terrain";
 static const int		WINDOW_HEIGHT = 1080 / 1.5;
 static const int		WINDOW_WIDTH = 1920 / 1.5;
 static const bool		FULL_SCREEN = false;
@@ -93,6 +94,11 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prevInstance, PSTR cmdLine, int
 		Scene S(WIN.Height(), WIN.Width(), &DEV);
 		pScene = &S;
 
+		// === FPS state ===
+		using clock = std::chrono::high_resolution_clock;
+		auto lastTitleTime = clock::now();
+		int frames = 0;
+
 		MSG msg;
 		ZeroMemory(&msg, sizeof(MSG));
 
@@ -112,6 +118,23 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prevInstance, PSTR cmdLine, int
 			}
 
 			S.Update();
+			++frames;
+
+			// –аз в ~1 секунду обновл€ем заголовок окна
+			auto now = clock::now();
+			std::chrono::duration<double> span = now - lastTitleTime;
+			if (span.count() >= 1.0) {
+				double fps = frames / span.count();
+				double ms = 1000.0 / (fps > 0.0 ? fps : 1.0);
+
+				wchar_t title[256];
+				swprintf_s(title, L"%s | FPS: %.1f | %.2f ms", appName, fps, ms);
+				SetWindowTextW(WIN.GetWindow(), title);
+
+				frames = 0;
+				lastTitleTime = now;
+			}
+
 			Sleep(1);
 		}
 	}
@@ -126,3 +149,4 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prevInstance, PSTR cmdLine, int
 		return 4;
 	}
 }
+
