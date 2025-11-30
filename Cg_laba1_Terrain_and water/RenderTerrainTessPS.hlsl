@@ -28,8 +28,8 @@ cbuffer FrameCB : register(b1)
     bool useTex;
 }
 
-Texture2D<float4> hmTex : register(t0);
-Texture2D<float4> dispTex : register(t1);
+Texture2D<float4> hmTex : register(t0); // heightmap
+Texture2D<float4> dispTex : register(t1); // normal map (RGB) + paint mask (A)
 Texture2D<float> shTex : register(t2);
 Texture2DArray<float4> detTex : register(t3);
 
@@ -47,6 +47,7 @@ struct PS_IN
 // тени
 static const float SMAP_SIZE = 4096.0f;
 static const float SMAP_DX = 1.0f / SMAP_SIZE;
+
 static const float4 cols[] =
 {
     float4(0.35f, 0.50f, 0.18f, 1.0f),
@@ -72,11 +73,11 @@ float3x3 getFrame(float3 N, float3 p, float2 uv)
     return float3x3(T * invm, B * invm, N);
 }
 
-// возмущение нормали
+// возмущение нормали из карты
 float3 perturbN(float3 N, float3 V, float2 uv, Texture2D tex, SamplerState smp)
 {
     float3 map = 2.0f * tex.Sample(smp, uv).xyz - 1.0f;
-    map.z *= 2.0f; // чутка выше
+    map.z *= 2.0f;
     float3x3 TBN = getFrame(N, -V, uv);
     return normalize(mul(map, TBN));
 }
@@ -204,6 +205,7 @@ float3 getTexSlope(float slope, float height, float3 N, float3 uvw, float startI
 {
     float4 c;
     float blend;
+
     if (slope < 0.6f)
     {
         blend = slope / 0.6f;
@@ -230,6 +232,7 @@ float4 getColorSlope(float slope, float height)
 {
     float4 c;
     float blend;
+
     if (slope < 0.6f)
     {
         blend = slope / 0.6f;
@@ -255,7 +258,7 @@ float4 getColorSlope(float slope, float height)
 float3 perturbNHeightSlope(float height, float slope, float3 N, float3 V, float3 uvw)
 {
     float3 c = getTexSlope(slope, height, N, uvw, 0) - 0.5f;
-    float3x3 TBN = getFrame(N, -V, uvw);
+    float3x3 TBN = getFrame(N, -V, uvw.xy);
     return normalize(mul(c, TBN));
 }
 
@@ -264,17 +267,19 @@ float4 distTexturing(float height, float slope, float3 N, float3 V, float3 uvw)
 {
     float dist = length(V);
 
-    if (dist > 75)
+    if (dist > 75.0f)
         return getColorSlope(slope, height);
-    else if (dist > 25)
+    else if (dist > 25.0f)
     {
         float blend = (dist - 25.0f) / (75.0f - 25.0f);
-        float4 c1 = float4(getTexSlope(slope, height, N, uvw, 4), 1);
+        float4 c1 = float4(getTexSlope(slope, height, N, uvw, 4), 1.0f);
         float4 c2 = getColorSlope(slope, height);
         return lerp(c1, c2, blend);
     }
     else
-        return float4(getTexSlope(slope, height, N, uvw, 4), 1);
+    {
+        return float4(getTexSlope(slope, height, N, uvw, 4), 1.0f);
+    }
 }
 
 // нормали по дистанции
@@ -282,12 +287,12 @@ float3 distNormal(float height, float slope, float3 N, float3 V, float3 uvw)
 {
     float dist = length(V);
 
-    float3 N1 = perturbN(N, V, uvw / 16, dispTex, dispSamp);
-	
-    if (dist > 150)
+    float3 N1 = perturbN(N, V, uvw.xy / 16.0f, dispTex, dispSamp);
+
+    if (dist > 150.0f)
         return N;
 
-    if (dist > 100)
+    if (dist > 100.0f)
     {
         float blend = (dist - 100.0f) / 50.0f;
         return lerp(N1, N, blend);
@@ -295,10 +300,10 @@ float3 distNormal(float height, float slope, float3 N, float3 V, float3 uvw)
 
     float3 N2 = perturbNHeightSlope(height, slope, N1, V, uvw);
 
-    if (dist > 50)
+    if (dist > 50.0f)
         return N1;
 
-    if (dist > 25)
+    if (dist > 25.0f)
     {
         float blend = (dist - 25.0f) / 25.0f;
         return lerp(N2, N1, blend);
@@ -368,22 +373,43 @@ float pickCascade(float4 shpos[4])
     return calcShadow(shpos[3]);
 }
 
-// основной пиксельный
 float4 main(PS_IN I) : SV_TARGET
 {
-    float3 Nhm = estimateN(I.wpos / worldW);
+    // UV дл€ heightmap
+    float2 hmUV = float2(I.wpos.x / worldW, I.wpos.y / worldD);
+
+    // базова€ нормаль из heightmap
+    float3 Nhm = estimateN(hmUV);
+
     float3 Vdir = eyePos.xyz - I.wpos;
-
     float slope = acos(Nhm.z);
-    float3 N = distNormal(I.wpos.z, slope, Nhm, Vdir, I.wpos / 2);
 
+    // detail-нормали + LOD по рассто€нию
+    float3 uvw = I.wpos / 2.0f;
+    float3 N = distNormal(I.wpos.z, slope, Nhm, Vdir, uvw);
+
+    // базовый цвет террейна
     float4 col;
     if (useTex)
-        col = distTexturing(I.wpos.z, slope, N, Vdir, I.wpos / 2);
+        col = distTexturing(I.wpos.z, slope, N, Vdir, uvw);
     else
         col = getColorSlope(slope, I.wpos.z);
 
-    float shadowFactor = 1.0f; // если надо Ч заменить на pickCascade(I.shpos)
+    // ==== ѕќ –ј— ј  »—“№ё “≈ —“”–ќ… ====
+    float2 dispUV = float2(I.wpos.x / worldW, I.wpos.y / worldD);
+    float paintMask = dispTex.SampleLevel(dispSamp, dispUV, 0).a;
+    paintMask = saturate(paintMask);
+
+    float3 paintUVW = I.wpos / 4.0f;
+    static const float PAINT_SLICE = 4.0f; // слой, который используем как "краску"
+
+    float4 paintTex = sampleTri(paintUVW, N, PAINT_SLICE);
+
+    col = lerp(col, paintTex, paintMask);
+    // ==== /ѕќ –ј— ј ====
+
+
+    float shadowFactor = 1.0f; // или pickCascade(I.shpos);
 
     float ndl = dot(-light.dir, N);
     float4 diff = max(shadowFactor, light.amb) * light.dif * ndl;

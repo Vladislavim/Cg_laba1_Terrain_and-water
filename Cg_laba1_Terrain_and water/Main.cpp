@@ -17,6 +17,11 @@ static const bool		FULL_SCREEN = false;
 static Scene* pScene = nullptr;
 static int				lastMouseX = -1;
 static int				lastMouseY = -1;
+// ==== Глобальные переменные мыши ====
+int  gMouseX = 0;
+int  gMouseY = 0;
+bool gMouseLeftDown = false;
+
 
 static void KeyUp(UINT key) {
 	switch (key) {
@@ -37,12 +42,13 @@ static void KeyDown(UINT key) {
 	case _Z:
 	case _1:
 	case _2:
-	case _T:
+	//case _T:
 	case _L:
 		if (pScene) pScene->HandleKeyboardInput(key);
 		break;
 	}
 }
+
 
 static void HandleMouseMove(LPARAM lp) {
 	int x = GET_X_LPARAM(lp);
@@ -65,20 +71,50 @@ static LRESULT CALLBACK WndProc(HWND win, UINT msg, WPARAM wp, LPARAM lp) {
 	case WM_CLOSE:
 		PostQuitMessage(0);
 		return 0;
+
 	case WM_KEYUP:
 		KeyUp((UINT)wp);
 		break;
+
 	case WM_KEYDOWN:
 		KeyDown((UINT)wp);
 		break;
+
 	case WM_MOUSEMOVE:
-		HandleMouseMove(lp);
+	{
+		int x = GET_X_LPARAM(lp);
+		int y = GET_Y_LPARAM(lp);
+
+		if ((wp & MK_LBUTTON) && pScene)
+		{
+			// рисуем кистью
+			pScene->HandleMouseClick(x, y, WINDOW_WIDTH, WINDOW_HEIGHT);
+
+		}
+		else
+		{
+			// крутим камеру только когда ЛКМ не зажата
+			HandleMouseMove(lp);
+		}
 		break;
+	}
+
+
+
+	case WM_LBUTTONUP:
+		if (pScene)
+			pScene->ResetBrushStroke();
+		break;
+
+
 	default:
 		return DefWindowProc(win, msg, wp, lp);
 	}
 	return 0;
 }
+
+
+
 
 int WINAPI WinMain(HINSTANCE instance, HINSTANCE prevInstance, PSTR cmdLine, int cmdShow) {
 	AllocConsole();

@@ -548,6 +548,72 @@ void Scene::HandleMouseInput(int x, int y) {
         m_Cam.Yaw(-ROT_ANGLE * x);
     }
 }
+void Scene::HandleMouseClick(int mouseX, int mouseY, int screenWidth, int screenHeight)
+{
+    if (!m_pT) return;
+
+    // 1. ЅерЄм viewProj и считаем его инверс
+    XMFLOAT4X4 vpT = m_Cam.GetViewProjectionMatrixTransposed();
+    XMMATRIX vp = XMLoadFloat4x4(&vpT);
+    XMMATRIX viewProj = XMMatrixTranspose(vp);                 // разворачиваем transpose
+    XMMATRIX invViewProj = XMMatrixInverse(nullptr, viewProj); // (view * proj)^-1
+
+    // 2. ћышь (пиксели) -> NDC [-1..1]
+    float ndcX = 2.0f * mouseX / screenWidth - 1.0f;
+    float ndcY = 1.0f - 2.0f * mouseY / screenHeight; // инверси€ Y
+
+    XMVECTOR nearPt = XMVectorSet(ndcX, ndcY, 0.0f, 1.0f);
+    XMVECTOR farPt = XMVectorSet(ndcX, ndcY, 1.0f, 1.0f);
+
+    // 3. ¬осстанавливаем мировые near/far и направление луча
+    nearPt = XMVector3TransformCoord(nearPt, invViewProj);
+    farPt = XMVector3TransformCoord(farPt, invViewProj);
+
+    XMVECTOR dirVec = XMVector3Normalize(farPt - nearPt);
+
+    XMFLOAT3 o, d;
+    XMStoreFloat3(&o, nearPt);
+    XMStoreFloat3(&d, dirVec);
+
+    // 4. »дЄм по лучу вперЄд и ищем пересечение с террейном
+    float t = 0.0f;
+    const float dt = 5.0f;       // шаг вдоль луча
+    const float maxDist = 3000.0f;
+
+    while (t < maxDist)
+    {
+        float px = o.x + d.x * t;
+        float py = o.y + d.y * t;
+        float pz = o.z + d.z * t;
+
+        // X,Y Ч плоскость, Z Ч высота
+        float terrainZ = m_pT->GetHeightAtPoint(px, py);
+
+        // когда луч опустилс€ ниже поверхности Ч считаем, что попали
+        if (pz <= terrainZ)
+        {
+            const float brushRadiusWorld = 100.0f;
+            m_pT->PaintBrushAt(px, py, brushRadiusWorld);
+
+            // ќЅ≈ карты заливаем на GPU:
+            m_pT->ReuploadDisplacementMap();
+            m_pT->ReuploadHeightMap();     // <-- вот этого не хватало
+
+            break;
+        }
+
+
+
+        t += dt;
+    }
+}
+
+// Scene.cpp
+void Scene::ResetBrushStroke()
+{
+    m_hasLastBrushPoint = false;
+}
+
 
 // рисуем воду (сначала AABB-фрустум тест Ч если не видно, выходим)
 void Scene::DrawWater(ID3D12GraphicsCommandList* cmdList) {

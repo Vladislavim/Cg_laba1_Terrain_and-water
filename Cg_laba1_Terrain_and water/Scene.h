@@ -26,7 +26,10 @@ public:
     void HandleKeyboardInput(UINT key);
 
     void HandleMouseInput(int x, int y);
+    void HandleMouseClick(int mouseX, int mouseY, int screenWidth, int screenHeight);
 
+    bool RaycastTerrain(int mouseX, int mouseY, int screenWidth, int screenHeight, XMFLOAT3& outHit);
+    void ResetBrushStroke();
 private:
 
     void CloseCommandLists();
@@ -73,4 +76,6 @@ private:
     float                               m_WaveLen = 50.0f;
     float                               m_WaveSpeed = 0.8f;
     std::chrono::steady_clock::time_point m_prevTime;
+    bool     m_hasLastBrushPoint = false;
+    XMFLOAT3 m_lastBrushPoint = XMFLOAT3(0, 0, 0);
 };

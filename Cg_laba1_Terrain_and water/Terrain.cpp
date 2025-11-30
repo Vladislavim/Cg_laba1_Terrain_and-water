@@ -16,8 +16,33 @@
 // общий шаг тессел€ции (храним в статике)
 static int& G_TerrainTess()
 {
-    static int g_tess = 32;
+    static int g_tess = 64;
     return g_tess;
+}
+namespace
+{
+    inline int clampi(int v, int lo, int hi)
+    {
+        return v < lo ? lo : (v > hi ? hi : v);
+    }
+
+    inline float saturatef(float x)
+    {
+        return x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x);
+    }
+
+    // плавное затухание кисти от центра к краю (smoothstep)
+    inline float BrushFalloff(float dist2, float radius)
+    {
+        if (radius <= 0.0f) return 0.0f;
+
+        float r2 = radius * radius;
+        if (dist2 >= r2) return 0.0f;
+
+        float t = 1.0f - dist2 / r2;     // 0..1
+        // сглаживаем, чтобы не было жЄсткого кра€
+        return t * t * (3.0f - 2.0f * t);
+    }
 }
 
 // проверка расширени€ файла без аллокаций
@@ -49,6 +74,7 @@ Terrain::Terrain(ResourceManager* rm, TerrainMaterial* mat,
     m_dataVertices = nullptr;
     m_dataIndices = nullptr;
     m_pConstants = nullptr;
+    m_idxDisplacementGPU = (unsigned int)-1;
 
     // загрузка карт
     LoadHeightMap(fnHeightmap);
@@ -58,6 +84,7 @@ Terrain::Terrain(ResourceManager* rm, TerrainMaterial* mat,
     CreateMesh3D();
     BuildQT();
 }
+
 
 Terrain::~Terrain()
 {
@@ -376,6 +403,7 @@ XMFLOAT2 Terrain::CalcZBounds(Vertex bl, Vertex tr)
 void Terrain::LoadHeightMap(const char* fnHeightMap)
 {
     if (HasExtNoCase(fnHeightMap, ".dds")) {
+        // DDS-ветка как была: оставл€ем без возможности переаплоада
         unsigned int h = 0, w = 0;
         unsigned int idxCpu = m_pResMgr->LoadDDS_CPU_RGBA8A(fnHeightMap, h, w);
         m_dataHeightMap = m_pResMgr->GetFileData(idxCpu);
@@ -402,7 +430,8 @@ void Terrain::LoadHeightMap(const char* fnHeightMap)
         ID3D12Resource* hm = nullptr;
         CD3DX12_HEAP_PROPERTIES defHeap(D3D12_HEAP_TYPE_DEFAULT);
 
-        unsigned int iBuffer = m_pResMgr->NewBuffer(
+        // сохран€ем индекс буфера в m_idxHeightGPU
+        m_idxHeightGPU = m_pResMgr->NewBuffer(
             hm, &descTex, &defHeap, D3D12_HEAP_FLAG_NONE,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr);
         hm->SetName(L"Height Map");
@@ -412,7 +441,8 @@ void Terrain::LoadHeightMap(const char* fnHeightMap)
         dataTex.RowPitch = m_wHeightMap * 4;
         dataTex.SlicePitch = m_hHeightMap * m_wHeightMap * 4;
 
-        m_pResMgr->UploadToBuffer(iBuffer, 1, &dataTex,
+        m_pResMgr->UploadToBuffer(
+            m_idxHeightGPU, 1, &dataTex,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
         D3D12_SHADER_RESOURCE_VIEW_DESC descSRV = {};
@@ -425,6 +455,29 @@ void Terrain::LoadHeightMap(const char* fnHeightMap)
     }
 }
 
+
+
+
+void Terrain::ReuploadHeightMap()
+{
+    if (m_idxHeightGPU == (unsigned int)-1 || !m_dataHeightMap)
+        return;
+
+    D3D12_SUBRESOURCE_DATA dataTex = {};
+    dataTex.pData = m_dataHeightMap;
+    dataTex.RowPitch = m_wHeightMap * 4;
+    dataTex.SlicePitch = m_hHeightMap * m_wHeightMap * 4;
+
+    m_pResMgr->UploadToBuffer(
+        m_idxHeightGPU,
+        1,
+        &dataTex,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+}
+
+
+
+
 void Terrain::LoadDisplacementMap(const char* fnMap)
 {
     if (HasExtNoCase(fnMap, ".dds")) {
@@ -433,6 +486,14 @@ void Terrain::LoadDisplacementMap(const char* fnMap)
         m_dataDisplacementMap = m_pResMgr->GetFileData(idxCpu);
         m_wDisplacementMap = w;
         m_hDisplacementMap = h;
+
+        // --- ќЅЌ”Ћя≈ћ јЋ№‘” ѕќƒ  »—“№ ---
+        if (m_dataDisplacementMap) {
+            const size_t pxCount = size_t(m_wDisplacementMap) * size_t(m_hDisplacementMap);
+            for (size_t i = 0; i < pxCount; ++i) {
+                m_dataDisplacementMap[i * 4 + 3] = 0; // A = 0
+            }
+        }
 
         D3D12_RESOURCE_DESC descTex = {};
         descTex.MipLevels = 1;
@@ -448,8 +509,9 @@ void Terrain::LoadDisplacementMap(const char* fnMap)
         ID3D12Resource* dm = nullptr;
         CD3DX12_HEAP_PROPERTIES defHeap(D3D12_HEAP_TYPE_DEFAULT);
 
-        unsigned int iBuffer = m_pResMgr->NewBuffer(
-            dm, &descTex, &defHeap, D3D12_HEAP_FLAG_NONE,
+        m_idxDisplacementGPU = m_pResMgr->NewBuffer(
+            dm, &descTex, &defHeap,
+            D3D12_HEAP_FLAG_NONE,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
             nullptr);
         dm->SetName(L"Displacement Map (DDS?RGBA8)");
@@ -459,7 +521,10 @@ void Terrain::LoadDisplacementMap(const char* fnMap)
         dataTex.RowPitch = m_wDisplacementMap * 4;
         dataTex.SlicePitch = m_hDisplacementMap * m_wDisplacementMap * 4;
 
-        m_pResMgr->UploadToBuffer(iBuffer, 1, &dataTex,
+        m_pResMgr->UploadToBuffer(
+            m_idxDisplacementGPU,
+            1,
+            &dataTex,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
         D3D12_SHADER_RESOURCE_VIEW_DESC descSRV = {};
@@ -471,8 +536,16 @@ void Terrain::LoadDisplacementMap(const char* fnMap)
         m_pResMgr->AddSRV(dm, &descSRV, m_hdlDisplacementMapSRV_CPU, m_hdlDisplacementMapSRV_GPU);
     }
     else {
-        unsigned int index = m_pResMgr->LoadFile(fnMap, m_hDisplacementMap, m_wDisplacementMap);
-        m_dataDisplacementMap = m_pResMgr->GetFileData(index);
+        unsigned int idxCpu = m_pResMgr->LoadFile(fnMap, m_hDisplacementMap, m_wDisplacementMap);
+        m_dataDisplacementMap = m_pResMgr->GetFileData(idxCpu);
+
+        // --- ќЅЌ”Ћя≈ћ јЋ№‘” ѕќƒ  »—“№ ---
+        if (m_dataDisplacementMap) {
+            const size_t pxCount = size_t(m_wDisplacementMap) * size_t(m_hDisplacementMap);
+            for (size_t i = 0; i < pxCount; ++i) {
+                m_dataDisplacementMap[i * 4 + 3] = 0; // A = 0
+            }
+        }
 
         D3D12_RESOURCE_DESC descTex = {};
         descTex.MipLevels = 1;
@@ -488,9 +561,11 @@ void Terrain::LoadDisplacementMap(const char* fnMap)
         ID3D12Resource* dm = nullptr;
         CD3DX12_HEAP_PROPERTIES defHeap(D3D12_HEAP_TYPE_DEFAULT);
 
-        unsigned int iBuffer = m_pResMgr->NewBuffer(
-            dm, &descTex, &defHeap, D3D12_HEAP_FLAG_NONE,
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr);
+        m_idxDisplacementGPU = m_pResMgr->NewBuffer(
+            dm, &descTex, &defHeap,
+            D3D12_HEAP_FLAG_NONE,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            nullptr);
         dm->SetName(L"Displacement Map");
 
         D3D12_SUBRESOURCE_DATA dataTex = {};
@@ -498,7 +573,10 @@ void Terrain::LoadDisplacementMap(const char* fnMap)
         dataTex.RowPitch = m_wDisplacementMap * 4;
         dataTex.SlicePitch = m_hDisplacementMap * m_wDisplacementMap * 4;
 
-        m_pResMgr->UploadToBuffer(iBuffer, 1, &dataTex,
+        m_pResMgr->UploadToBuffer(
+            m_idxDisplacementGPU,
+            1,
+            &dataTex,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
         D3D12_SHADER_RESOURCE_VIEW_DESC descSRV = {};
@@ -510,6 +588,106 @@ void Terrain::LoadDisplacementMap(const char* fnMap)
         m_pResMgr->AddSRV(dm, &descSRV, m_hdlDisplacementMapSRV_CPU, m_hdlDisplacementMapSRV_GPU);
     }
 }
+
+
+
+void Terrain::ReuploadDisplacementMap()
+{
+    if (m_idxDisplacementGPU == (unsigned int)-1 || !m_dataDisplacementMap)
+        return;
+
+    D3D12_SUBRESOURCE_DATA dataTex = {};
+    dataTex.pData = m_dataDisplacementMap;
+    dataTex.RowPitch = m_wDisplacementMap * 4;
+    dataTex.SlicePitch = m_hDisplacementMap * m_wDisplacementMap * 4;
+
+    m_pResMgr->UploadToBuffer(
+        m_idxDisplacementGPU,
+        1,
+        &dataTex,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+}
+void Terrain::PaintBrushAt(float worldX, float worldY, float radiusWorld)
+{
+    if (!m_dataDisplacementMap || !m_dataHeightMap ||
+        m_wDisplacementMap == 0 || m_hDisplacementMap == 0 ||
+        m_wHeightMap == 0 || m_hHeightMap == 0)
+    {
+        return;
+    }
+
+    // центр кисти в координатах heightmap
+    const int cx = (int)std::round(worldX);
+    const int cy = (int)std::round(worldY);
+
+    int r = (int)std::round(radiusWorld);
+    if (r <= 0) r = 1;
+
+    const int minX = clampi(cx - r, 0, (int)m_wHeightMap - 1);
+    const int maxX = clampi(cx + r, 0, (int)m_wHeightMap - 1);
+    const int minY = clampi(cy - r, 0, (int)m_hHeightMap - 1);
+    const int maxY = clampi(cy + r, 0, (int)m_hHeightMap - 1);
+
+    // сила выдавливани€ в мировых единицах
+    const float sculptStrengthWorld = 0.0f;   // можно подстроить
+
+    for (int y = minY; y <= maxY; ++y)
+    {
+        for (int x = minX; x <= maxX; ++x)
+        {
+            const float dx = float(x - cx);
+            const float dy = float(y - cy);
+            const float d2 = dx * dx + dy * dy;
+
+            const float w = BrushFalloff(d2, (float)r);
+            if (w <= 0.0f)
+                continue;
+
+            // ===== 1) выдавливаем геометрию в heightmap (R-канал) =====
+            {
+                const int idxH = (y * (int)m_wHeightMap + x) * 4 + 0;
+                unsigned char& hr = m_dataHeightMap[idxH];
+
+                // нормализованна€ высота
+                float hNorm = (float)hr / 255.0f;
+
+                // переводим желаемый подъЄм в нормализованное значение
+                float delta = (sculptStrengthWorld * w) / m_scaleHeightMap;
+                hNorm = saturatef(hNorm + delta);
+
+                hr = (unsigned char)(hNorm * 255.0f + 0.5f);
+            }
+
+            // ===== 2) обновл€ем маску в displacement (A-канал) =====
+            {
+                int texX = x * (int)m_wDisplacementMap / (int)m_wHeightMap;
+                int texY = y * (int)m_hDisplacementMap / (int)m_hHeightMap;
+
+                texX = clampi(texX, 0, (int)m_wDisplacementMap - 1);
+                texY = clampi(texY, 0, (int)m_hDisplacementMap - 1);
+
+                const int idxD = (texY * (int)m_wDisplacementMap + texX) * 4 + 3;
+                unsigned char& a = m_dataDisplacementMap[idxD];
+
+                const int newMask = (int)(w * 255.0f + 0.5f);
+                if (newMask > (int)a)
+                    a = (unsigned char)newMask;
+            }
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
 
 //   биндинги  
 
@@ -618,20 +796,11 @@ XMFLOAT3 Terrain::CalculateNormalAtPoint(float x, float y)
 
 float Terrain::GetHeightAtPoint(float x, float y)
 {
+    // высота только из heightmap, без displacement
     float z = GetHeightMapValueAtPoint(x, y) * m_scaleHeightMap;
-    float d = 2.0f * GetDisplacementMapValueAtPoint(x, y) - 1.0f;
-
-    XMFLOAT3 n = CalculateNormalAtPoint(x, y);
-    XMFLOAT3 p(x, y, z);
-
-    XMVECTOR nv = XMLoadFloat3(&n);
-    XMVECTOR pv = XMLoadFloat3(&p);
-    XMVECTOR pf = pv + nv * 0.5f * d;
-
-    XMFLOAT3 outP;
-    XMStoreFloat3(&outP, pf);
-    return outP.z;
+    return z;
 }
+
 
 //   квадродерево (LOD)  
 

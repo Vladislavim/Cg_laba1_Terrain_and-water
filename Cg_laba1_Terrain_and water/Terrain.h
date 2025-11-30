@@ -39,7 +39,9 @@ public:
     BoundingSphere GetBoundingSphere() { return m_BoundingSphere; }
     float GetHeightAtPoint(float x, float y);
     void DrawLOD(ID3D12GraphicsCommandList* cmdList, const DirectX::XMFLOAT4& eye);
-
+    void PaintBrushAt(float worldX, float worldY, float radiusWorld);
+    void ReuploadDisplacementMap();
+    void ReuploadHeightMap();
 private:
     void CreateMesh3D();
     void CreateVertexBuffer();
@@ -84,5 +86,6 @@ private:
     int m_scalePatchX = 0;  // число вершин по X (в сетке патчей)
     int m_scalePatchY = 0;  // число вершин по Y (в сетке патчей)
     int m_tessStep = 64;  // шаг по heightmap для одной «клетки патча»
-
+    unsigned int m_idxDisplacementGPU = (unsigned int)-1;
+    unsigned int m_idxHeightGPU = (unsigned int)-1;
 };
